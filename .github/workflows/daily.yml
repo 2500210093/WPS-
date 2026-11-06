@@ -406,7 +406,7 @@ jobs:
                       {"tag": "div", "text": {"tag": "lark_md", "content": chr(10).join(lines)}},
                       {"tag": "hr"},
                       {"tag": "note", "elements": [{"tag": "plain_text",
-                                                     "content": "每天下午 2 点自动运行 · 版本 V7 · 没启用的项目不会报错，也不影响网易云"}]},
+                                                     "content": "每天下午 2 点自动运行 · 版本 V8 · 没启用的项目不会报错，也不影响网易云"}]},
                   ],
               }
               payload = {"msg_type": "interactive", "card": card}
@@ -466,105 +466,337 @@ jobs:
           main()
           PY
   anyrouter:
-    name: Any Router 账号签到（可选）
+    name: Any Router / AgentRouter 签到（可选）
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 8
     continue-on-error: true
-    env:
-      ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
-      ENABLE_ANYROUTER: ${{ secrets.ENABLE_ANYROUTER }}
     steps:
-      - name: 准备签到配置
-        id: check
+      - name: 执行签到并写出结果
+        id: checkin
         env:
+          AGENTROUTER_LOGIN: ${{ secrets.AGENTROUTER_LOGIN }}
+          AGENTROUTER_COOKIE: ${{ secrets.AGENTROUTER_COOKIE }}
+          USERNAME: ${{ secrets.USERNAME }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
           ANYROUTER_RAW_COOKIE: ${{ secrets.ANYROUTER_RAW_COOKIE }}
+          ENABLE_ANYROUTER: ${{ secrets.ENABLE_ANYROUTER }}
         run: |
           python3 - <<'PY'
-          import json, os, re
-          raw = (os.environ.get("ANYROUTER_RAW_COOKIE") or "").strip()
-          accounts = (os.environ.get("ANYROUTER_ACCOUNTS") or "").strip()
-          manual_off = (os.environ.get("ENABLE_ANYROUTER") or "").strip() == "no"
-          cfg, mode, reason = "", "", ""
-          if manual_off:
-              reason = "manual_off"
-              print("已手动停用（ENABLE_ANYROUTER=no），跳过")
-          elif raw:
-              m = re.search(r"(?:^|[;\s])session=([^;\s]+)", raw)
-              sid = m.group(1).strip().strip('"').strip("'") if m else ""
-              if not sid:
-                  reason = "raw_no_session"
-                  print("这串 Cookie 里没找到 session=...，请复制 Network 里完整的 cookie 那一行")
+          import gzip
+          import http.cookiejar
+          import json
+          import os
+          import re
+          import ssl
+          import sys
+          import urllib.error
+          import urllib.request
+
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+          SITES = ["https://agentrouter.org", "https://ps.air-outer.com", "https://anyrouter.top"]
+          RESULT = "/tmp/ar_result.json"
+
+
+          def log(msg):
+              print(msg, flush=True)
+
+
+          def env(name):
+              return (os.environ.get(name) or "").strip()
+
+
+          def body_text(raw):
+              try:
+                  if raw[:2] == b"\x1f\x8b":
+                      raw = gzip.decompress(raw)
+              except Exception:
+                  pass
+              return raw.decode("utf-8", "replace")
+
+
+          def is_waf(text):
+              low = text.lower()
+              return ("<" in text and ("acw_sc__v2" in low or "acw_tc" in low
+                                       or "captcha" in low or "滑块" in text or "challenge" in low))
+
+
+          def request(site, path, method="GET", payload=None, cookie="", api_user="", jar=None, timeout=20):
+              # 统一 HTTP 出口：测试时用假的 request 替换即可，不发任何真实请求
+              headers = {
+                  "User-Agent": UA,
+                  "Accept": "application/json, text/plain, */*",
+                  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                  "Content-Type": "application/json",
+                  "Origin": site,
+                  "Referer": site + "/console",
+                  "X-Requested-With": "XMLHttpRequest",
+              }
+              if cookie:
+                  headers["Cookie"] = cookie
+              if api_user:
+                  headers["new-api-user"] = str(api_user)
+              data = json.dumps(payload).encode("utf-8") if payload is not None else None
+              req = urllib.request.Request(site + path, data=data, headers=headers, method=method)
+              opener = urllib.request.build_opener(
+                  urllib.request.HTTPCookieProcessor(jar if jar is not None else http.cookiejar.CookieJar()),
+                  urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+              try:
+                  with opener.open(req, timeout=timeout) as r:
+                      return r.status, r.read(), r.headers
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read(), e.headers
+              except Exception as e:
+                  return 0, ("%s: %s" % (type(e).__name__, e)).encode("utf-8"), {}
+
+
+          def parse_accounts(raw):
+              # 把任意写法的账号配置拆成凭证列表：坏格式一律返回空列表，绝不抛异常
+              out = []
+              if not raw:
+                  return out
+              try:
+                  obj = json.loads(raw)
+                  if isinstance(obj, dict):
+                      obj = [obj]
+                  if isinstance(obj, list):
+                      for it in obj:
+                          if not isinstance(it, dict):
+                              continue
+                          ck = it.get("cookies") if isinstance(it.get("cookies"), dict) else {}
+                          sid = it.get("session") or ck.get("session")
+                          if sid:
+                              out.append({"kind": "cookie", "cookie": "session=" + str(sid),
+                                          "api_user": str(it.get("api_user") or "")})
+                          elif it.get("email") and it.get("password"):
+                              out.append({"kind": "password", "email": str(it["email"]),
+                                          "password": str(it["password"]), "api_user": str(it.get("api_user") or "")})
+                      if out:
+                          return out
+              except Exception:
+                  pass
+              for line in raw.splitlines():
+                  s = line.strip().strip(",").strip("[]{}").strip().strip('"').strip()
+                  if not s or s.startswith("#") or s.startswith("//"):
+                      continue
+                  if re.search(r"(^|[;\s])session=", s, re.I) or "acw_tc=" in s:
+                      m = re.search(r"(?i)new-api-user[=:]\s*(\d+)", s)
+                      out.append({"kind": "cookie", "cookie": s,
+                                  "api_user": m.group(1) if m else ""})
+                  elif ":" in s:
+                      site = ""
+                      if "|" in s:
+                          site, s = s.split("|", 1)
+                          s = s.strip()
+                      email, pwd = s.split(":", 1)
+                      if email.strip() and pwd.strip():
+                          out.append({"kind": "password", "email": email.strip(),
+                                      "password": pwd.strip(), "site": site.strip(), "api_user": ""})
+              return out
+
+
+          def collect():
+              # 收集所有凭证来源，任一有效即可；返回 (creds, notes)
+              creds, notes = [], []
+
+              def add(items, origin):
+                  for c in items:
+                      c = dict(c)
+                      c["from"] = origin
+                      c["label"] = ("浏览器 Cookie（%s）" % origin) if c["kind"] == "cookie" else ("账号密码（%s）" % origin)
+                      creds.append(c)
+
+              add(parse_accounts(env("AGENTROUTER_LOGIN")), "AGENTROUTER_LOGIN")
+
+              u, p = env("USERNAME"), env("PASSWORD")
+              if u and p:
+                  add([{"kind": "password", "email": u, "password": p, "site": "", "api_user": ""}], "USERNAME / PASSWORD")
+
+              for name in ("AGENTROUTER_COOKIE", "ANYROUTER_RAW_COOKIE"):
+                  raw = env(name)
+                  if not raw:
+                      continue
+                  if raw.lstrip().startswith("["):
+                      add(parse_accounts(raw), name)
+                  else:
+                      m = re.search(r"(?i)new-api-user[=:]\s*(\d+)", raw)
+                      add([{"kind": "cookie", "cookie": raw,
+                            "api_user": m.group(1) if m else ""}], name)
+
+              old = env("ANYROUTER_ACCOUNTS")
+              if old:
+                  parsed = parse_accounts(old)
+                  if parsed:
+                      add(parsed, "ANYROUTER_ACCOUNTS")
+                  else:
+                      notes.append("旧的 ANYROUTER_ACCOUNTS 里的内容没认出来（既不是 JSON、也不是 邮箱:密码），"
+                                   "这次先跳过它；它不会让任务报错，也不影响其它填法")
+
+              # 去重
+              seen, uniq = set(), []
+              for c in creds:
+                  key = (c["kind"], c.get("email", ""), c.get("password", ""), c.get("cookie", ""))
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  uniq.append(c)
+              return uniq, notes
+
+
+          def quota_of(data):
+              try:
+                  d = data.get("data") or {}
+                  q = d.get("quota")
+                  if q is None:
+                      return ""
+                  return "$%.2f" % (float(q) / 500000.0)
+              except Exception:
+                  return ""
+
+
+          def one_attempt(site, cred):
+              info = {"site": site, "mode": cred["label"], "ok": False, "balance": "",
+                      "evidence": "", "problem": "", "waf": False, "api": ""}
+              jar = http.cookiejar.CookieJar()
+              cookie = cred.get("cookie", "") if cred["kind"] == "cookie" else ""
+              api_user = cred.get("api_user", "")
+              authenticated = False
+
+              if cred["kind"] == "password":
+                  st, raw, _ = request(site, "/api/user/login", "POST",
+                                       {"username": cred["email"], "password": cred["password"]}, jar=jar)
+                  text = body_text(raw)
+                  info["api"] = "POST /api/user/login -> %s" % st
+                  if is_waf(text):
+                      info["waf"] = True
+                      info["problem"] = "网站弹了人机验证（WAF），这个服务器 IP 被挡了"
+                      return info
+                  try:
+                      d = json.loads(text)
+                  except Exception:
+                      d = {}
+                  if not d.get("success"):
+                      msg = str(d.get("message") or d.get("msg") or text[:100]).strip()
+                      info["problem"] = "登录没通过：%s" % msg
+                      return info
+                  info["evidence"] = "登录接口返回成功（success=true）"
+                  authenticated = True
               else:
-                  cfg = json.dumps([{"cookies": {"session": sid}}], ensure_ascii=False)
-                  mode, reason = "session", "running"
-                  print("已用浏览器 Cookie 生成 session 配置（不走账号密码登录）")
-          elif accounts:
-              cfg, mode, reason = accounts, "account", "running"
-              print("使用 ANYROUTER_ACCOUNTS 原样配置")
-          else:
-              reason = "no_accounts"
-              print("没填任何账号配置，跳过")
-          with open("/tmp/ar_accounts.json", "w", encoding="utf-8") as f:
-              f.write(cfg)
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-              f.write("enabled=%s\n" % ("true" if cfg else "false"))
-              f.write("reason=%s\n" % reason)
-              f.write("mode=%s\n" % mode)
+                  info["evidence"] = "直接用了浏览器登录态"
+                  info["api"] = "GET /api/user/self -> 待查"
+
+              st2, raw2, _ = request(site, "/api/user/self", "GET", None,
+                                     cookie=cookie, api_user=api_user, jar=jar)
+              text2 = body_text(raw2)
+              info["api"] = "GET /api/user/self -> %s" % st2
+              if is_waf(text2):
+                  info["waf"] = True
+                  info["problem"] = "网站弹了人机验证（WAF），这个服务器 IP 被挡了"
+                  return info
+              try:
+                  d2 = json.loads(text2)
+              except Exception:
+                  d2 = {}
+              if st2 == 200 and d2.get("success"):
+                  info["balance"] = quota_of(d2)
+                  info["ok"] = True
+                  info["evidence"] += "，并读到账号余额 %s" % (info["balance"] or "（站点没给数字）")
+                  return info
+              msg2 = str(d2.get("message") or text2[:100]).strip()
+              info["problem"] = "读账号信息没通过（HTTP %s）：%s" % (st2, msg2)
+
+              # 旧站 anyrouter.top 还留着独立签到接口；只有确实登录上了才允许拿它兜底，
+              # 否则「没登录却返回 success」会造成假成功
+              if authenticated and "anyrouter.top" in site:
+                  st3, raw3, _ = request(site, "/api/user/sign_in", "POST", {},
+                                         cookie=cookie, api_user=api_user, jar=jar)
+                  t3 = body_text(raw3)
+                  try:
+                      d3 = json.loads(t3)
+                  except Exception:
+                      d3 = {}
+                  msg3 = str(d3.get("message") or d3.get("msg") or "")
+                  if st3 == 200 and (d3.get("success") or d3.get("ret") == 1 or d3.get("code") == 0
+                                     or any(k in msg3 for k in ("已签到", "已经签到", "重复签到"))):
+                      info["ok"] = True
+                      info["problem"] = ""
+                      info["api"] = "POST /api/user/sign_in -> %s" % st3
+                      info["evidence"] = "签到接口返回成功或「今天已签到」：%s" % (msg3 or "success")
+              return info
+
+
+          def main():
+              result = {"status": "no_credentials", "ok": False, "site": "", "mode": "",
+                        "balance": "", "evidence": "", "problem": "", "waf": False,
+                        "notes": [], "attempts": [], "version": "V8"}
+              if env("ENABLE_ANYROUTER") == "no":
+                  result["status"] = "disabled"
+                  result["problem"] = "你手动停用了（Secret ENABLE_ANYROUTER=no），今天没签到"
+                  log("已手动停用（ENABLE_ANYROUTER=no）")
+              else:
+                  creds, notes = collect()
+                  result["notes"] = notes
+                  for n in notes:
+                      log(n)
+                  if not creds:
+                      result["problem"] = "没找到能用的账号 / Cookie，今天没签到"
+                      log(result["problem"])
+                  else:
+                      log("找到 %d 份配置，开始逐个尝试（任一成功即停）" % len(creds))
+                      for site in SITES:
+                          for c in creds:
+                              site_override = c.get("site") or ""
+                              if site_override:
+                                  target = site_override.rstrip("/")
+                              else:
+                                  target = site
+                              try:
+                                  r = one_attempt(target, c)
+                              except Exception as e:
+                                  r = {"site": target, "mode": c["label"], "ok": False, "balance": "",
+                                       "evidence": "", "problem": "%s: %s" % (type(e).__name__, e),
+                                       "waf": False, "api": ""}
+                              result["attempts"].append(r)
+                              log("[%s] %s / %s -> %s %s" % (
+                                  "OK" if r["ok"] else "NO", target, c["label"],
+                                  r["evidence"] or r["problem"], r["api"]))
+                              if r["ok"]:
+                                  break
+                          if any(a["ok"] for a in result["attempts"]):
+                              break
+                      good = next((a for a in result["attempts"] if a["ok"]), None)
+                      if good:
+                          result.update({"status": "ok", "ok": True, "site": good["site"],
+                                         "mode": good["mode"], "balance": good["balance"],
+                                         "evidence": good["evidence"]})
+                          log("签到动作完成：%s" % good["evidence"])
+                      else:
+                          result["status"] = "failed"
+                          result["site"] = SITES[0]
+                          result["mode"] = creds[0]["label"]
+                          result["waf"] = any(a.get("waf") for a in result["attempts"])
+                          tried = []
+                          for a in result["attempts"]:
+                              s = a["problem"]
+                              if s and s not in tried:
+                                  tried.append(s)
+                          result["problem"] = "；".join(tried[:2]) or "所有方式都没签到成功"
+                          log("没签到成功：%s" % result["problem"])
+              with open(RESULT, "w", encoding="utf-8") as f:
+                  json.dump(result, f, ensure_ascii=False, indent=2)
+              log("结果已写出：" + RESULT)
+
+
+          main()
           PY
-
-      - name: 拉取 Any Router 签到项目（固定版本）
-        if: steps.check.outputs.enabled == 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: millylee/anyrouter-check-in
-          ref: 3b16662142c68703ea3e79c77c06a8cf6bba7990
-
-      - name: 安装 uv
-        if: steps.check.outputs.enabled == 'true'
-        uses: astral-sh/setup-uv@v5
-
-      - name: 安装 Python 3.11
-        if: steps.check.outputs.enabled == 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: 安装系统依赖
-        if: steps.check.outputs.enabled == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-wqy-zenhei fonts-freefont-ttf
-
-      - name: 安装项目依赖
-        if: steps.check.outputs.enabled == 'true'
-        run: uv sync --frozen
-
-      - name: 安装 CloakBrowser
-        if: steps.check.outputs.enabled == 'true'
-        run: uv run python -m cloakbrowser install
-
-      - name: 执行签到（日志留存）
-        id: checkin
-        if: steps.check.outputs.enabled == 'true'
-        env:
-          CHECKIN_HEADLESS: "false"
-          CHECKIN_HUMANIZE: "true"
-          CHECKIN_WAIT_TIMEOUT_MS: "120000"
-          DEBUG_MODE: "true"
-        run: |
-          set -o pipefail
-          export ANYROUTER_ACCOUNTS="$(cat /tmp/ar_accounts.json)"
-          xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run checkin.py 2>&1 | tee /tmp/anyrouter-checkin.log
 
       - name: 飞书通知（Any Router 结果）
         if: always()
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
-          ACCOUNTS_ENABLED: ${{ steps.check.outputs.enabled }}
-          AR_REASON: ${{ steps.check.outputs.reason }}
-          AR_MODE: ${{ steps.check.outputs.mode }}
-          CHECKIN_OUTCOME: ${{ steps.checkin.outcome }}
+          AR_RESULT_PATH: /tmp/ar_result.json
         run: |
           python3 - <<'PY'
           import base64
@@ -572,7 +804,6 @@ jobs:
           import hmac
           import json
           import os
-          import re
           import time
           import urllib.request
 
@@ -581,123 +812,86 @@ jobs:
               print("没填 FEISHU_WEBHOOK，无法推送")
               raise SystemExit(0)
 
-          enabled = (os.environ.get("ACCOUNTS_ENABLED") or "").strip() == "true"
-          reason = (os.environ.get("AR_REASON") or "").strip()
-          mode = (os.environ.get("AR_MODE") or "").strip()
-          outcome = (os.environ.get("CHECKIN_OUTCOME") or "").strip() or "skipped"
-          log_path = (os.environ.get("AR_LOG_PATH") or "/tmp/anyrouter-checkin.log").strip()
-
-          log_text = ""
+          path = (os.environ.get("AR_RESULT_PATH") or "/tmp/ar_result.json").strip()
           try:
-              with open(log_path, encoding="utf-8", errors="replace") as f:
-                  log_text = f.read()
+              with open(path, encoding="utf-8") as f:
+                  r = json.load(f)
           except Exception:
-              pass
-          clean_lines = []
-          for ln in log_text.splitlines():
-              c = re.sub(r"\x1b\[[0-9;]*m", "", ln).strip()
-              if c:
-                  clean_lines.append(c)
+              r = {"status": "failed", "problem": "签到脚本没写出结果文件，可能没跑起来",
+                   "site": "", "mode": "", "balance": "", "evidence": "", "waf": False,
+                   "notes": [], "attempts": []}
 
-          signed = any(k in log_text for k in (
-              "Check-in successful", "Already checked in today", "All accounts check-in successful"))
-          login_failed = any(k in log_text for k in (
-              "not verified", "Email/password login failed", "Login verification failed"))
-          waf_hit = any(k in log_text for k in (
-              "Unable to get WAF cookies", "WAF", "acw_sc__v2", "captcha", "challenge"))
-          session_mode = (mode == "session"
-                          or "Using auth method -> session cookies" in log_text
-                          or "Bypass WAF not required, using user cookies directly" in log_text)
-          ok = enabled and outcome == "success" and signed
-
+          status = r.get("status") or "failed"
+          ok = bool(r.get("ok"))
           lines = []
-          if not enabled:
-              status, template = "未启用", "orange"
-              if reason == "manual_off":
-                  detail = "你手动停用了（Secret ENABLE_ANYROUTER=no），今天没签到。想恢复就把这个 Secret 删掉"
-              elif reason == "raw_no_session":
-                  detail = "ANYROUTER_RAW_COOKIE 里没找到 session=...，复制时要连 session= 一起、复制完整那一整行"
-              elif reason == "no_accounts":
-                  detail = "没填账号，今天没签到。想用就照下面加一个 Secret ANYROUTER_RAW_COOKIE"
-              else:
-                  detail = "本次没有运行，今天没签到"
-          elif ok:
-              status, template = "签到成功", "green"
-              detail = "日志里有签到成功记录。去 anyrouter.top 看额度/余额有没有变化，能核对上才算真签到"
-          elif outcome == "success":
-              status, template = "没签到成功", "orange"
-              detail = "脚本跑完了，但日志里没找到「签到成功」记录，本次不算签到成功"
-          else:
-              status, template = "没签到成功", "orange"
-              detail = "签到脚本没跑完，下面是日志里最相关的几行："
 
-          lines.append("**Any Router [%s]** %s" % (status, detail))
-          lines.append("")
-          lines.append("**本次登录方式**：%s" % (
-              "浏览器 Cookie（session，绕开账号密码）" if mode == "session" else "账号密码 / 原配置"))
+          if status == "disabled":
+              head, color = "未启用", "orange"
+              lines.append("**Any Router [未启用]** 你手动停用了（`ENABLE_ANYROUTER=no`），今天没签到。")
+              lines.append("想恢复就把这个 Secret 删掉。网易云和 WPS 完全不受影响。")
+          elif status == "no_credentials":
+              head, color = "未启用", "orange"
+              lines.append("**Any Router [未启用]** 一个能用的账号 / Cookie 都没找到，今天没签到。")
+          elif ok:
+              head, color = "签到成功", "green"
+              lines.append("**Any Router [签到成功]** 已在 **%s** 完成登录签到。" % (r.get("site") or "官网"))
+          else:
+              head, color = "没签到成功", "orange"
+              lines.append("**Any Router [没签到成功]** %s" % (r.get("problem") or "没找到签到成功记录"))
+
+          if status not in ("disabled", "no_credentials"):
+              lines.append("")
+              lines.append("**本次登录方式**：%s" % (r.get("mode") or "未识别"))
+              if ok:
+                  lines.append("**官网余额**：%s" % (r.get("balance") or "站点没返回数字"))
+                  lines.append("**核对依据**：%s" % (r.get("evidence") or "接口返回成功"))
+                  lines.append("")
+                  lines.append("去 %s/console 刷新页面，看今天的 $25 有没有到账；"
+                               "余额能核对上才算真签到。" % (r.get("site") or "https://agentrouter.org"))
+              else:
+                  if r.get("waf"):
+                      lines.append("")
+                      lines.append("**网站把 GitHub 服务器拦了**")
+                      lines.append("· 已经自动试过备用域名 `ps.air-outer.com`，仍被拦。")
+                      lines.append("· 浏览器 Cookie 里自带网站通行证，改用下面的 Cookie 办法通常就能过。")
 
           if not ok:
-              hints = []
-              keys = ("[FAILED]", "[WARN]", "[ERROR]", "登录失败", "密码", "账号", "错误", "失败",
-                      "Error", "Exception", "timeout", "超时", "验证", "captcha", "not verified",
-                      "Current URL", "Got cookies", "WAF", "session", "401")
-              for ln in clean_lines[-250:]:
-                  if any(k in ln for k in keys) and ln[:110] not in hints:
-                      hints.append(ln[:110])
-              hints = hints[-4:]
-              if hints:
-                  lines.append("")
-                  lines.append("**日志关键行**")
-                  for h in hints:
-                      lines.append("· " + h)
+              lines.append("")
+              lines.append("**账号填在哪（只加 1 个 Secret 就行）**")
+              lines.append("1. 仓库 → Settings → Secrets and variables → Actions → **New repository secret**")
+              lines.append("2. Name 填 `AGENTROUTER_LOGIN`")
+              lines.append("3. Value 填 `你的登录邮箱:你的登录密码`，例如 `abc@qq.com:123456`")
+              lines.append("   · 中间一个冒号，**不要写 JSON、不要加引号、不要方括号**")
+              lines.append("4. Add secret → Actions → **Run workflow** 再跑一次")
+              lines.append("")
+              lines.append("**如果你是 GitHub / LinuxDO 一键登录注册的**")
+              lines.append("· 这种账号**没有密码**，账号密码怎么填都签不上，这是之前一直失败的主要原因之一。")
+              lines.append("· 改用浏览器 Cookie：Chrome 登录官网 → `F12` → Network → `F5` 刷新 → 点第一个请求")
+              lines.append("  → Headers → Request Headers → 复制 `cookie:` 后面**完整一整串**")
+              lines.append("· 新建一个 Secret：Name `AGENTROUTER_COOKIE`，Value 粘贴那一整串 → Add secret")
+              lines.append("· 两种填法可以同时存在，脚本会自动挑能用的那个")
 
-              if reason == "raw_no_session":
-                  lines.append("")
-                  lines.append("**复制的时候少了东西**")
-                  lines.append("· 要复制 F12 → Network → 请求头里 `cookie:` 后面**完整一整串**，里面要有 `session=一串字符`")
-              elif login_failed and not session_mode:
-                  lines.append("")
-                  lines.append("**这次卡在哪：还在用账号密码登录，网站没认出来**")
-                  lines.append("· 日志里有 `Email/password login failed`，说明 Secret 还是账号密码那种，所以和上次一样")
-                  lines.append("")
-                  lines.append("**只加 1 个 Secret 就能绕开登录（不用改 JSON、不用找 session）**")
-                  lines.append("1. 电脑 Chrome 打开 anyrouter.top 并登录，按 `F12` → Network（网络）→ 按 `F5` 刷新")
-                  lines.append("2. 点列表里第一个请求 → 右边 Headers → Request Headers → 找到 `cookie:` 那一行 → 复制**后面整串**")
-                  lines.append("3. 仓库 → Settings → Secrets and variables → Actions → New repository secret")
-                  lines.append("4. Name 填 `ANYROUTER_RAW_COOKIE`，Value 粘贴刚才那一整串 → Add secret")
-                  lines.append("5. 再 Run workflow 一次。原来的 `ANYROUTER_ACCOUNTS` 不用删，新的会自动优先")
-                  lines.append("· 卡片「本次登录方式」变成「浏览器 Cookie」就说明改生效了")
-              elif session_mode:
-                  lines.append("")
-                  lines.append("**session 方式也失败了**")
-                  lines.append("· 多半是这个 session 过期了，或网站把 GitHub 的服务器拦了")
-                  lines.append("· 重新登录 anyrouter.top → 重新复制 `cookie:` 那一整串 → 打开 Secret `ANYROUTER_RAW_COOKIE` 点 Update 覆盖 → 再跑一次")
-              elif waf_hit:
-                  lines.append("")
-                  lines.append("**网站的人机验证挡住了**")
-                  lines.append("· 日志里出现 WAF / 验证码，GitHub 的服务器 IP 被 anyrouter.top 拦了")
-                  lines.append("· 按上面 1~4 步加 `ANYROUTER_RAW_COOKIE` 再试一次；仍不行就是网站对云服务器限制，只能在你自己电脑上跑")
-              else:
-                  lines.append("")
-                  lines.append("**账号填在哪**")
-                  lines.append("1. 仓库 → Settings → Secrets and variables → Actions → New repository secret")
-                  lines.append("2. Name 填 `ANYROUTER_RAW_COOKIE`")
-                  lines.append("3. Value 粘贴浏览器 F12 → Network → 请求头 `cookie:` 后面那一整串")
-                  lines.append("4. 想继续用账号密码也行，把 `ANYROUTER_ACCOUNTS` 点 Update 重新确认一遍")
+          notes = r.get("notes") or []
+          if notes:
+              lines.append("")
+              lines.append("**顺带提醒**")
+              for n in notes[:2]:
+                  lines.append("· " + n)
 
           lines.append("")
           lines.append("**本次是否签到成功：%s**" % ("是" if ok else "否"))
-          if not enabled:
+          if status in ("disabled", "no_credentials"):
               lines.append("（这是「没启用 / 没配好」，不是签到本身出错；网易云和 WPS 完全不受影响）")
 
           card = {
               "config": {"wide_screen_mode": True},
-              "header": {"title": {"tag": "plain_text", "content": "Any Router · %s" % status},
-                         "template": template},
+              "header": {"title": {"tag": "plain_text", "content": "Any Router · %s" % head},
+                         "template": color},
               "elements": [
                   {"tag": "div", "text": {"tag": "lark_md", "content": chr(10).join(lines)}},
                   {"tag": "hr"},
-                  {"tag": "note", "elements": [{"tag": "plain_text", "content": "Any Router · 每天下午 2 点 · 版本 V7"}]},
+                  {"tag": "note", "elements": [{"tag": "plain_text",
+                                                "content": "Any Router · 每天下午 2 点 · 版本 V8"}]},
               ],
           }
           payload = {"msg_type": "interactive", "card": card}
@@ -716,4 +910,3 @@ jobs:
           except Exception as e:
               print("飞书推送失败:", type(e).__name__, e)
           PY
-
