@@ -14,51 +14,188 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Verify project files
-        run: |
-          for f in run.py notify.py sign/netease.py sign/wps.py; do
-            if [ ! -f "$f" ]; then
-              echo "::error::缺少文件 $f，请把交付包中的文件放到仓库根目录后重新运行"
-              exit 1
-            fi
-          done
-          if grep -q "bilibili" run.py; then
-            echo "::error::run.py 仍是旧版（含 B站等旧平台），请用交付包覆盖"
-            exit 1
-          fi
-          if ! grep -q "feishu" notify.py; then
-            echo "::error::notify.py 仍是旧版（无飞书通知），请用交付包覆盖"
-            exit 1
-          fi
-          if ! grep -q "encSecKey" sign/netease.py; then
-            echo "::error::sign/netease.py 仍是旧版（明文签到），请用交付包覆盖"
-            exit 1
-          fi
-          echo "项目文件齐全且为新版"
-
-      - name: Install dependencies
-        run: python -m pip install --quiet "requests>=2.28" "pycryptodome>=3.18"
-
       - name: Run daily sign-in
         env:
           WPS_COOKIE: ${{ secrets.WPS_COOKIE }}
           NETEASE_COOKIE: ${{ secrets.NETEASE_COOKIE }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
-        run: python run.py
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.request
 
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sign-logs
-          path: sign.log
-          if-no-files-found: ignore
+          UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+          UA_IPHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 13_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.1 Mobile/15E148 Safari/604.1"
+          UA_MAC = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.1 Safari/605.1.15"
+
+
+          def http(url, method="GET", headers=None, body=None):
+              req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                  return resp.read().decode("utf-8", "replace")
+
+
+          def as_json(raw):
+              try:
+                  return json.loads(raw)
+              except Exception:
+                  return {"_raw": raw[:160]}
+
+
+          def wps_sign(cookie):
+              """WPS：微信打卡 + App/稻壳签到双路径，任一成功即算成功。"""
+              cookie = (cookie or "").strip()
+              m = re.search(r"(?:^|[;,\s])wps_sid=([^;,\s]+)", cookie)
+              sid = m.group(1) if m else (cookie if cookie.startswith("V02S") else "")
+              if not sid:
+                  return False, "WPS_COOKIE 里找不到 wps_sid，请重新抓 Cookie（登录 zt.wps.cn 后 F12 找 wps_sid）"
+
+              cookie_header = cookie if "wps_sid=" in cookie else "wps_sid=" + sid
+              notes = []
+
+              # 路径 A：微信打卡（sid 头）
+              try:
+                  raw = http("https://zt.wps.cn/2018/clock_in/api/clock_in?award=wps",
+                             headers={"sid": sid, "User-Agent": UA_PC, "Referer": "https://zt.wps.cn/"})
+                  d = as_json(raw)
+                  msg = str(d.get("msg") or "")
+                  result = str(d.get("result") or "")
+                  print("  [WPS 打卡] " + raw[:200])
+                  if result == "ok" or "已打卡" in msg or "已签到" in msg:
+                      return True, "打卡成功（微信打卡）" + (" · " + msg if msg else "")
+                  if "未报名" in msg:
+                      try:
+                          http("https://zt.wps.cn/2018/clock_in/api/sign_up?member=wps",
+                               headers={"sid": sid, "User-Agent": UA_PC})
+                          raw2 = http("https://zt.wps.cn/2018/clock_in/api/clock_in?award=wps",
+                                      headers={"sid": sid, "User-Agent": UA_PC})
+                          d2 = as_json(raw2)
+                          if str(d2.get("result")) == "ok" or "已打卡" in str(d2.get("msg") or ""):
+                              return True, "报名后打卡成功"
+                      except Exception as e:
+                          notes.append("报名重试: " + type(e).__name__)
+                  notes.append("打卡: " + (msg or result or raw[:80]))
+              except Exception as e:
+                  notes.append("打卡请求异常: %s: %s" % (type(e).__name__, e))
+
+              # 路径 B：App / 稻壳签到（完整 Cookie + 客户端头）
+              try:
+                  raw = http("https://zt.wps.cn/2018/docer_check_in/api/checkin_today", method="POST",
+                             headers={
+                                 "Cookie": cookie_header,
+                                 "User-Agent": UA_IPHONE,
+                                 "Origin": "https://zt.wps.cn",
+                                 "Referer": "https://zt.wps.cn/static/2019/docer_check_in_ios/dist/?position=member_ios",
+                                 "X-Requested-With": "XMLHttpRequest",
+                                 "Accept": "application/json, text/javascript, */*; q=0.01",
+                             })
+                  d = as_json(raw)
+                  msg = str(d.get("msg") or "")
+                  result = str(d.get("result") or "")
+                  print("  [WPS App签到] " + raw[:200])
+                  if result == "ok" or "已签到" in msg or "已打卡" in msg or "recheckin" in msg:
+                      return True, "签到成功（App/稻壳）" + (" · " + msg if msg else "")
+                  notes.append("App签到: " + (msg or result or raw[:80]))
+              except Exception as e:
+                  notes.append("App签到请求异常: %s: %s" % (type(e).__name__, e))
+
+              if any(x in " ".join(notes) for x in ("no login", "no_login", "未登录")):
+                  notes.append("=> wps_sid 已失效，请重新抓 Cookie")
+              return False, "；".join(notes)
+
+
+          def netease_sign(cookie):
+              """网易云：dailyTask type=0(App) / type=1(Web)，沿用 chavyleung/scripts 的存活接口。"""
+              cookie = (cookie or "").strip()
+              if not cookie:
+                  return False, "未配置 NETEASE_COOKIE"
+              notes = []
+              for typ, ua, label in ((0, UA_IPHONE, "App"), (1, UA_MAC, "Web")):
+                  try:
+                      raw = http("https://music.163.com/api/point/dailyTask?type=%d" % typ,
+                                 headers={"Cookie": cookie, "User-Agent": ua,
+                                          "Host": "music.163.com", "Referer": "https://music.163.com/"})
+                      d = as_json(raw)
+                      code = d.get("code")
+                      print("  [网易云 %s] %s" % (label, raw[:200]))
+                      if code in (200, -2) or "已签" in str(d.get("message") or ""):
+                          return True, "%s端签到成功（code=%s）" % (label, code)
+                      if code == 301:
+                          notes.append("%s: Cookie 失效或未登录（需含 MUSIC_U）" % label)
+                      else:
+                          notes.append("%s: code=%s %s" % (label, code, d.get("message") or ""))
+                  except Exception as e:
+                      notes.append("%s请求异常: %s: %s" % (label, type(e).__name__, e))
+              return False, "；".join(notes)
+
+
+          def push_feishu(webhook, secret, results, ok_count):
+              if not webhook:
+                  print("  [通知] 未配置 FEISHU_WEBHOOK，跳过推送")
+                  return
+              lines = ["**%s** [%s] %s" % (name, "成功" if ok else "失败", msg) for name, ok, msg in results]
+              template = "green" if ok_count == len(results) else ("red" if ok_count == 0 else "orange")
+              card = {
+                  "config": {"wide_screen_mode": True},
+                  "header": {"title": {"tag": "plain_text", "content": "每日签到报告 · %d/%d 成功" % (ok_count, len(results))},
+                             "template": template},
+                  "elements": [
+                      {"tag": "div", "text": {"tag": "lark_md", "content": chr(10).join(lines)}},
+                      {"tag": "hr"},
+                      {"tag": "note", "elements": [{"tag": "plain_text", "content": "WPS + 网易云音乐 · 每日签到"}]},
+                  ],
+              }
+              payload = {"msg_type": "interactive", "card": card}
+              if secret:
+                  ts = str(int(time.time()))
+                  digest = hmac.new((ts + chr(10) + secret).encode("utf-8"), digestmod=hashlib.sha256).digest()
+                  payload["timestamp"] = ts
+                  payload["sign"] = base64.b64encode(digest).decode("utf-8")
+              try:
+                  raw = http(webhook, method="POST", headers={"Content-Type": "application/json"},
+                             body=json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+                  print("  [通知] 飞书返回: " + raw[:200])
+              except Exception as e:
+                  print("  [通知] 推送失败: %s: %s" % (type(e).__name__, e))
+
+
+          def main():
+              wps_cookie = (os.environ.get("WPS_COOKIE") or "").strip()
+              netease_cookie = (os.environ.get("NETEASE_COOKIE") or "").strip()
+              webhook = (os.environ.get("FEISHU_WEBHOOK") or "").strip()
+              secret = (os.environ.get("FEISHU_SECRET") or "").strip()
+
+              if not wps_cookie and not netease_cookie:
+                  print("::error::未配置 WPS_COOKIE / NETEASE_COOKIE，请在仓库 Secrets 里添加")
+                  raise SystemExit(1)
+
+              print("=" * 50)
+              print("每日签到开始（WPS + 网易云音乐）")
+              print("=" * 50)
+              results = []
+              print("[1/2] WPS ...")
+              ok, msg = wps_sign(wps_cookie)
+              results.append(("WPS", ok, msg))
+              print("  -> [%s] %s" % ("成功" if ok else "失败", msg))
+              print("[2/2] 网易云音乐 ...")
+              ok, msg = netease_sign(netease_cookie)
+              results.append(("网易云音乐", ok, msg))
+              print("  -> [%s] %s" % ("成功" if ok else "失败", msg))
+
+              ok_count = sum(1 for _, ok, _ in results if ok)
+              print("成功 %d/%d" % (ok_count, len(results)))
+              push_feishu(webhook, secret, results, ok_count)
+              raise SystemExit(0 if ok_count == len(results) else 1)
+
+
+          main()
+
+          PY
