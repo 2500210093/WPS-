@@ -23,7 +23,6 @@ jobs:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
         run: |
-          if [ -n "$WPS_TASK_COOKIE" ]; then python3 -m pip install --quiet pycryptodome; fi
           python3 - <<'PY'
           import base64
           import hashlib
@@ -132,11 +131,150 @@ jobs:
                   return "Cookie 不完整，必须包含 wps_sid=...（教程第 3 步）"
               if "缺少 uid" in m:
                   return "Cookie 里没带 uid=数字，再加一个 Secret `WPS_UID`（WPS 账号信息里的数字用户 ID）"
-              if "pycryptodome" in m:
-                  return "加密库没装上，重跑一次 Actions 试试"
               if "HTTP" in m or "接口" in m or "异常" in m:
                   return "接口没返回成功：" + short(m, 90) + "（把这张卡片截图发我）"
               return short(m, 110)
+
+
+          # ---------- 零依赖加密：只用 Python 标准库，不装任何第三方包 ----------
+          # V5 会报「加密库没装上」，是因为 pip 只在新 Secret 存在时才执行；
+          # V6 直接自己实现 AES-256-CBC + RSA PKCS#1 v1.5，已与 pycryptodome 逐字节对照通过。
+
+          def _xt(a):
+              a <<= 1
+              return (a ^ 0x1B) & 0xFF if a & 0x100 else a & 0xFF
+
+
+          def _mul(a, b):
+              r = 0
+              for _ in range(8):
+                  if b & 1:
+                      r ^= a
+                  a = _xt(a)
+                  b >>= 1
+              return r
+
+
+          def _pow(a, n):
+              r = 1
+              while n:
+                  if n & 1:
+                      r = _mul(r, a)
+                  a = _mul(a, a)
+                  n >>= 1
+              return r
+
+
+          def _rotl(x, n):
+              return ((x << n) | (x >> (8 - n))) & 0xFF
+
+
+          SBOX = []
+          for _i in range(256):
+              _inv = _pow(_i, 254) if _i else 0
+              SBOX.append(_inv ^ _rotl(_inv, 1) ^ _rotl(_inv, 2) ^ _rotl(_inv, 3) ^ _rotl(_inv, 4) ^ 0x63)
+
+
+          def _expand(key):
+              w = [list(key[i * 4:(i + 1) * 4]) for i in range(8)]
+              rcon = 1
+              for i in range(8, 60):
+                  t = w[i - 1][:]
+                  if i % 8 == 0:
+                      t = t[1:] + t[:1]
+                      t = [SBOX[b] for b in t]
+                      t[0] ^= rcon
+                      rcon = _xt(rcon)
+                  elif i % 8 == 4:
+                      t = [SBOX[b] for b in t]
+                  w.append([w[i - 8][j] ^ t[j] for j in range(4)])
+              return w
+
+
+          def _enc_block(block, w):
+              s = [[block[c * 4 + r] for r in range(4)] for c in range(4)]
+
+              def ark(rnd):
+                  for c in range(4):
+                      for r in range(4):
+                          s[c][r] ^= w[rnd * 4 + c][r]
+
+              ark(0)
+              for rnd in range(1, 14):
+                  for c in range(4):
+                      for r in range(4):
+                          s[c][r] = SBOX[s[c][r]]
+                  for r in range(1, 4):
+                      row = [s[c][r] for c in range(4)]
+                      for c in range(4):
+                          s[c][r] = row[(c + r) % 4]
+                  for c in range(4):
+                      a0, a1, a2, a3 = (s[c][r] for r in range(4))
+                      s[c][0] = _mul(a0, 2) ^ _mul(a1, 3) ^ a2 ^ a3
+                      s[c][1] = a0 ^ _mul(a1, 2) ^ _mul(a2, 3) ^ a3
+                      s[c][2] = a0 ^ a1 ^ _mul(a2, 2) ^ _mul(a3, 3)
+                      s[c][3] = _mul(a0, 3) ^ a1 ^ a2 ^ _mul(a3, 2)
+                  ark(rnd)
+              for c in range(4):
+                  for r in range(4):
+                      s[c][r] = SBOX[s[c][r]]
+              for r in range(1, 4):
+                  row = [s[c][r] for c in range(4)]
+                  for c in range(4):
+                      s[c][r] = row[(c + r) % 4]
+              ark(14)
+              return bytes(s[c][r] for c in range(4) for r in range(4))
+
+
+          def aes_cbc_encrypt(plain, key, iv):
+              n = 16 - len(plain) % 16
+              data = plain + bytes([n]) * n
+              w = _expand(key)
+              out, prev = b"", iv
+              for i in range(0, len(data), 16):
+                  prev = _enc_block(bytes(x ^ y for x, y in zip(data[i:i + 16], prev)), w)
+                  out += prev
+              return out
+
+
+          def _tlv(buf, pos):
+              tag = buf[pos]
+              pos += 1
+              length = buf[pos]
+              pos += 1
+              if length & 0x80:
+                  nb = length & 0x7F
+                  length = int.from_bytes(buf[pos:pos + nb], "big")
+                  pos += nb
+              return tag, buf[pos:pos + length], pos + length
+
+
+          def rsa_pkcs1_encrypt(msg, public_key_pem):
+              body = "".join(ln.strip() for ln in public_key_pem.splitlines() if not ln.startswith("-----"))
+              der = base64.b64decode(body)
+              _, outer, _ = _tlv(der, 0)
+              t0, first, p1 = _tlv(outer, 0)
+              if t0 == 0x02:
+                  # WPS 实际返回的是 PKCS#1 裸公钥：SEQUENCE { INTEGER n, INTEGER e }
+                  nb = first
+                  _, eb, _ = _tlv(outer, p1)
+              else:
+                  # 也兼容常见的 SPKI：SEQUENCE { AlgorithmIdentifier, BIT STRING }
+                  _, bitstr, _ = _tlv(outer, p1)
+                  _, inner, _ = _tlv(bitstr, 1)
+                  _, nb, p2 = _tlv(inner, 0)
+                  _, eb, _ = _tlv(inner, p2)
+              n = int.from_bytes(nb.lstrip(b"\x00") or b"\x00", "big")
+              e = int.from_bytes(eb.lstrip(b"\x00") or b"\x00", "big")
+              k = (n.bit_length() + 7) // 8
+              assert k >= len(msg) + 11, "公钥太短"
+              ps = bytearray()
+              while len(ps) < k - len(msg) - 3:
+                  b = os.urandom(1)
+                  if b != b"\x00":
+                      ps += b
+              em = b"\x00\x02" + bytes(ps) + b"\x00" + msg
+              return pow(int.from_bytes(em, "big"), e, n).to_bytes(k, "big")
 
 
           def norm_wps_cookie(c):
@@ -158,14 +296,9 @@ jobs:
               user_id = int(uid) if str(uid or "").strip().isdigit() else (int(m_uid.group(1)) if m_uid else 0)
               if not user_id:
                   return False, "缺少 uid"
-              try:
-                  from Crypto.Cipher import AES, PKCS1_v1_5
-                  from Crypto.PublicKey import RSA
-                  from Crypto.Util.Padding import pad
-              except ImportError as e:
-                  return False, "缺少加密库 pycryptodome：%s" % e
               import random
               import string
+              print("  [WPS·加密] 内置加密已就绪（不依赖任何第三方库）")
               base = {
                   "User-Agent": UA_PC,
                   "Accept": "application/json, text/plain, */*",
@@ -186,8 +319,8 @@ jobs:
                   key_padded = kb + b"\x00" * (32 - len(kb))
                   iv = aes_key[:16].encode("utf-8")
                   plain = json.dumps({"user_id": user_id, "platform": 64}, separators=(",", ":")).encode("utf-8")
-                  extra = base64.b64encode(AES.new(key_padded, AES.MODE_CBC, iv).encrypt(pad(plain, 16))).decode("utf-8")
-                  token = base64.b64encode(PKCS1_v1_5.new(RSA.import_key(pub_pem)).encrypt(aes_key.encode("utf-8"))).decode("utf-8")
+                  extra = base64.b64encode(aes_cbc_encrypt(plain, key_padded, iv)).decode("utf-8")
+                  token = base64.b64encode(rsa_pkcs1_encrypt(aes_key.encode("utf-8"), pub_pem)).decode("utf-8")
                   body = json.dumps({"encrypt": True, "extra": extra, "pay_origin": "pc_ucs_rwzx_sign"}).encode("utf-8")
                   st2, raw2 = http("https://personal-bus.wps.cn/sign_in/v1/sign_in",
                                    method="POST", headers=dict(base, token=token), body=body)
@@ -273,7 +406,7 @@ jobs:
                       {"tag": "div", "text": {"tag": "lark_md", "content": chr(10).join(lines)}},
                       {"tag": "hr"},
                       {"tag": "note", "elements": [{"tag": "plain_text",
-                                                     "content": "每天下午 2 点自动运行 · 没启用的项目不会报错，也不影响网易云"}]},
+                                                     "content": "每天下午 2 点自动运行 · 版本 V6 · 没启用的项目不会报错，也不影响网易云"}]},
                   ],
               }
               payload = {"msg_type": "interactive", "card": card}
@@ -427,7 +560,26 @@ jobs:
           enabled = (os.environ.get("ACCOUNTS_ENABLED") or "").strip() == "true"
           reason = (os.environ.get("AR_REASON") or "").strip()
           outcome = (os.environ.get("CHECKIN_OUTCOME") or "").strip() or "skipped"
-          ok = enabled and outcome == "success"
+          log_path = (os.environ.get("AR_LOG_PATH") or "/tmp/anyrouter-checkin.log").strip()
+
+          log_text = ""
+          try:
+              with open(log_path, encoding="utf-8", errors="replace") as f:
+                  log_text = f.read()
+          except Exception:
+              pass
+          clean_lines = []
+          for ln in log_text.splitlines():
+              c = re.sub(r"\x1b\[[0-9;]*m", "", ln).strip()
+              if c:
+                  clean_lines.append(c)
+
+          # 真签到：日志里必须有签到成功标记，不能只看脚本有没有跑完
+          signed = any(k in log_text for k in (
+              "Check-in successful", "Already checked in today", "All accounts check-in successful"))
+          login_failed = any(k in log_text for k in (
+              "not verified", "Email/password login failed", "Login verification failed"))
+          ok = enabled and outcome == "success" and signed
 
           lines = []
           if not enabled:
@@ -435,45 +587,58 @@ jobs:
               if reason == "manual_off":
                   detail = "你手动停用了（Secret ENABLE_ANYROUTER=no），今天没签到。想恢复就把这个 Secret 删掉"
               elif reason == "no_accounts":
-                  detail = "没填账号密码，今天没签到。想用就加 Secret ANYROUTER_ACCOUNTS（教程第 4 步）"
+                  detail = "没填账号，今天没签到。想用就加 Secret ANYROUTER_ACCOUNTS（教程第 4 步）"
               else:
                   detail = "本次没有运行，今天没签到"
           elif ok:
               status, template = "签到成功", "green"
-              detail = "签到脚本跑完了，去 Any Router 网站看余额有没有变"
+              detail = "日志里有签到成功记录。去 anyrouter.top 看额度/余额有没有变化，能核对上才算真签到"
+          elif outcome == "success":
+              status, template = "没签到成功", "orange"
+              detail = "脚本跑完了，但日志里没找到「签到成功」记录，本次不算签到成功"
           else:
               status, template = "没签到成功", "orange"
-              detail = "签到脚本跑到一半失败了，下面是日志里最可能相关的几行："
+              detail = "签到脚本没跑完，下面是日志里最相关的几行："
 
           lines.append("**Any Router [%s]** %s" % (status, detail))
 
           if not ok:
               hints = []
-              try:
-                  with open("/tmp/anyrouter-checkin.log", encoding="utf-8", errors="replace") as f:
-                      log_lines = f.read().splitlines()
-                  keys = ("[FAILED]", "[WARN]", "登录失败", "密码", "账号", "错误", "失败",
-                          "Error", "error", "Exception", "timeout", "超时", "验证", "captcha")
-                  for ln in log_lines[-150:]:
-                      clean = re.sub(r"\x1b\[[0-9;]*m", "", ln).strip()
-                      if clean and any(k in clean for k in keys) and clean not in hints:
-                          hints.append(clean[:110])
-                  hints = hints[-3:]
-              except Exception:
-                  pass
+              keys = ("[FAILED]", "[WARN]", "[ERROR]", "登录失败", "密码", "账号", "错误", "失败",
+                      "Error", "Exception", "timeout", "超时", "验证", "captcha", "not verified")
+              for ln in clean_lines[-200:]:
+                  if any(k in ln for k in keys) and ln[:110] not in hints:
+                      hints.append(ln[:110])
+              hints = hints[-4:]
               if hints:
                   lines.append("")
                   lines.append("**日志关键行**")
                   for h in hints:
                       lines.append("· " + h)
 
-          if not ok:
-              lines.append("")
-              lines.append("**账号密码填在哪（照着核对一遍）**")
-              lines.append("1. 仓库 → Settings → Secrets and variables → Actions → New repository secret")
-              lines.append("2. Name 填 `ANYROUTER_ACCOUNTS`")
-              lines.append('3. Value 填 `[{"email":"你的登录邮箱","password":"你的登录密码"}]`')
-              lines.append("4. 用的是 anyrouter.top 网站自己的账号密码，不是 GitHub 密码；已填过就点 Update 重新确认一遍")
+              if login_failed:
+                  lines.append("")
+                  lines.append("**这次卡在哪：网站没认出账号登录**")
+                  lines.append("· 邮箱密码没通过 anyrouter.top 的登录校验。常见原因：密码写错、账号是 GitHub/Google 第三方登录（本来就没有密码）、或登录时弹了验证码")
+                  lines.append("")
+                  lines.append("**办法 B（推荐）：改用 session，不用浏览器登录**")
+                  lines.append("1. 电脑 Chrome 打开 anyrouter.top 并登录，按 F12 → Application（应用）→ Cookies → 复制名为 session 的值")
+                  lines.append("2. 同一页面 F12 → Network → 随便点一下，找请求头 New-Api-User，记下那串数字")
+                  lines.append("3. 仓库 → Settings → Secrets and variables → Actions → `ANYROUTER_ACCOUNTS` → Update")
+                  lines.append('4. 把值整个换成：`[{"cookies":{"session":"刚才复制的值"},"api_user":"那串数字"}]`')
+                  lines.append("5. 两种写法只能选一种：用了 cookies 就不要再写 email 和 password；session 大约一个月过期，过期后重新复制一次")
+                  lines.append("")
+                  lines.append("**办法 A：继续用账号密码**")
+                  lines.append('1. 先在浏览器手动登录一次 anyrouter.top，确认邮箱密码真的能登进去')
+                  lines.append("2. 仓库 → Settings → Secrets and variables → Actions → `ANYROUTER_ACCOUNTS` → Update")
+                  lines.append('3. 值填 `[{"email":"你的登录邮箱","password":"你的登录密码"}]`（网站自己的密码，不是 GitHub 密码）')
+              else:
+                  lines.append("")
+                  lines.append("**账号填在哪（照着核对一遍）**")
+                  lines.append("1. 仓库 → Settings → Secrets and variables → Actions → New repository secret")
+                  lines.append("2. Name 填 `ANYROUTER_ACCOUNTS`")
+                  lines.append('3. Value 填 `[{"email":"你的登录邮箱","password":"你的登录密码"}]`')
+                  lines.append("4. 用的是 anyrouter.top 网站自己的账号密码，不是 GitHub 密码；已填过就点 Update 重新确认一遍")
 
           lines.append("")
           lines.append("**本次是否签到成功：%s**" % ("是" if ok else "否"))
@@ -487,7 +652,7 @@ jobs:
               "elements": [
                   {"tag": "div", "text": {"tag": "lark_md", "content": chr(10).join(lines)}},
                   {"tag": "hr"},
-                  {"tag": "note", "elements": [{"tag": "plain_text", "content": "Any Router · 每天下午 2 点"}]},
+                  {"tag": "note", "elements": [{"tag": "plain_text", "content": "Any Router · 每天下午 2 点 · 版本 V6"}]},
               ],
           }
           payload = {"msg_type": "interactive", "card": card}
