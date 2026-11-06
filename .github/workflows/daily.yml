@@ -1,4 +1,4 @@
-name: 每日签到（WPS + 网易云音乐 + Any Router）
+name: 每日签到（网易云 + 可选 WPS / Any Router）
 
 on:
   workflow_dispatch:
@@ -16,11 +16,10 @@ jobs:
     steps:
       - name: Run daily sign-in
         env:
+          NETEASE_COOKIE: ${{ secrets.NETEASE_COOKIE }}
           WPS_TASK_COOKIE: ${{ secrets.WPS_TASK_COOKIE }}
           WPS_UID: ${{ secrets.WPS_UID }}
           WPS_COOKIE: ${{ secrets.WPS_COOKIE }}
-          LINGXI_COOKIE: ${{ secrets.LINGXI_COOKIE }}
-          NETEASE_COOKIE: ${{ secrets.NETEASE_COOKIE }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
         run: |
@@ -35,7 +34,6 @@ jobs:
           import sys
           import time
           import urllib.error
-          import urllib.parse
           import urllib.request
 
           UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
@@ -72,28 +70,100 @@ jobs:
                   return {"_raw": raw[:160]}
 
 
-          def short(text, n=150):
+          def short(text, n=140):
               text = str(text).replace("\n", " ")
-              return text if len(text) <= n else text[:n] + "..."
+              return text if len(text) <= n else text[:n] + "…"
+
+
+          def find_point(obj, depth=0):
+              """网易云奖励数值可能叫 point / points / award，也可能藏在 data 里；找不到就返回 None。"""
+              if depth > 3 or obj is None:
+                  return None
+              if isinstance(obj, dict):
+                  for k in ("point", "points", "award", "score", "num"):
+                      v = obj.get(k)
+                      if isinstance(v, (int, float)) and not isinstance(v, bool):
+                          return v
+                      if isinstance(v, str) and v.strip().isdigit():
+                          return int(v.strip())
+                  for v in obj.values():
+                      r = find_point(v, depth + 1)
+                      if r is not None:
+                          return r
+              return None
+
+
+          def netease_sign(cookie):
+              """网易云每日签到：code=200 成功 / -2 今日已签 / 301 未登录。"""
+              cookie = (cookie or "").strip()
+              if not cookie:
+                  return False, "没填 NETEASE_COOKIE，去仓库 Secrets 里加一个"
+              notes = []
+              for typ, ua, label in ((0, UA_IPHONE, "App"), (1, UA_MAC, "网页")):
+                  try:
+                      st, raw = http("https://music.163.com/api/point/dailyTask?type=%d" % typ,
+                                     headers={"Cookie": cookie, "User-Agent": ua,
+                                              "Referer": "https://music.163.com/"})
+                      d = as_json(raw)
+                      code = d.get("code")
+                      print("  [网易云 %s] HTTP %s %s" % (label, st, short(raw, 160)))
+                      if code in (200, -2) or "已签" in str(d.get("message") or ""):
+                          if code == -2:
+                              return True, "今天已经签过了（重复签到，不用再签）"
+                          point = find_point(d)
+                          if point is not None:
+                              return True, "签到成功，云贝/经验 +%s。去 App「云贝中心」能核对" % point
+                          return True, "签到成功，云贝已发放。去 App「云贝中心」核对余额"
+                      if code == 301:
+                          notes.append("%s：Cookie 失效了，重新抓一次 NETEASE_COOKIE（要含 MUSIC_U）" % label)
+                      else:
+                          notes.append("%s：接口返回 code=%s %s" % (label, code, d.get("message") or ""))
+                  except Exception as e:
+                      notes.append("%s：连不上（%s）" % (label, type(e).__name__))
+              return False, "；".join(notes)
+
+
+          def humanize_wps(msg):
+              """把接口黑话翻译成人话。"""
+              m = str(msg)
+              if "userNotLogin" in m or "登录态失效" in m:
+                  return "Cookie 不被任务中心认可，去「WPS 任务中心」那个页面重新抓一次（教程第 3 步）"
+              if "named cookie" in m or "没有 wps_sid" in m or "缺 wps_sid" in m:
+                  return "Cookie 不完整，必须包含 wps_sid=...（教程第 3 步）"
+              if "缺少 uid" in m:
+                  return "Cookie 里没带 uid=数字，再加一个 Secret `WPS_UID`（WPS 账号信息里的数字用户 ID）"
+              if "pycryptodome" in m:
+                  return "加密库没装上，重跑一次 Actions 试试"
+              if "HTTP" in m or "接口" in m or "异常" in m:
+                  return "接口没返回成功：" + short(m, 90) + "（把这张卡片截图发我）"
+              return short(m, 110)
+
+
+          def norm_wps_cookie(c):
+              """只贴了一串 V02S... 时自动补成 wps_sid=..."""
+              c = (c or "").strip()
+              if c and "wps_sid=" not in c and c.startswith("V02S"):
+                  return "wps_sid=" + c
+              return c
 
 
           def task_center_sign(cookie, uid):
-              """WPS 任务中心「签到领奖励」——用户后台能看到的那一个（AES + RSA 加密接口）。"""
+              """WPS 用户中心 →「任务 → 签到领奖励」——后台能看见的那一个。"""
               cookie = (cookie or "").strip()
               if not cookie:
-                  return False, "未配置 WPS_TASK_COOKIE（需含 wps_sid 与 uid 的任务中心 Cookie）"
+                  return False, "没填 WPS_TASK_COOKIE"
               if "wps_sid=" not in cookie:
-                  return False, "WPS_TASK_COOKIE 里没有 wps_sid，接口会报 named cookie not present"
+                  return False, "Cookie 里没有 wps_sid"
               m_uid = re.search(r"(?:^|[;,\s])uid=(\d+)", cookie)
               user_id = int(uid) if str(uid or "").strip().isdigit() else (int(m_uid.group(1)) if m_uid else 0)
               if not user_id:
-                  return False, "缺少 uid：请在 Cookie 里保留 uid=数字，或单独配置 WPS_UID"
+                  return False, "缺少 uid"
               try:
                   from Crypto.Cipher import AES, PKCS1_v1_5
                   from Crypto.PublicKey import RSA
                   from Crypto.Util.Padding import pad
               except ImportError as e:
-                  return False, "缺少加密库 pycryptodome（workflow 应自动安装）：%s" % e
+                  return False, "缺少加密库 pycryptodome：%s" % e
               import random
               import string
               base = {
@@ -107,9 +177,9 @@ jobs:
               try:
                   st, raw = http("https://personal-bus.wps.cn/sign_in/v1/encrypt/key", headers=base)
                   d = as_json(raw)
-                  print("  [WPS 任务中心·公钥] HTTP %s %s" % (st, short(raw, 120)))
+                  print("  [WPS·公钥] HTTP %s %s" % (st, short(raw, 120)))
                   if d.get("result") != "ok" or not d.get("data"):
-                      return False, "获取公钥失败：HTTP %s %s" % (st, short(str(d.get("msg") or raw), 100))
+                      return False, "获取公钥失败：HTTP %s %s" % (st, short(str(d.get("msg") or raw), 90))
                   pub_pem = base64.b64decode(d["data"]).decode("utf-8")
                   aes_key = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(22)) + str(int(time.time()))
                   kb = aes_key.encode("utf-8")
@@ -122,202 +192,88 @@ jobs:
                   st2, raw2 = http("https://personal-bus.wps.cn/sign_in/v1/sign_in",
                                    method="POST", headers=dict(base, token=token), body=body)
                   d2 = as_json(raw2)
-                  print("  [WPS 任务中心·签到] HTTP %s %s" % (st2, short(raw2, 220)))
+                  print("  [WPS·签到] HTTP %s %s" % (st2, short(raw2, 200)))
                   if d2.get("result") == "ok":
                       data = d2.get("data") or {}
                       rewards = data.get("rewards") or []
                       names = [str(r.get("reward_name", "")) for r in rewards
                                if isinstance(r, dict) and r.get("reward_name")]
-                      detail = "、".join(names) if names else short(json.dumps(data, ensure_ascii=False), 100)
-                      return True, "任务中心签到成功（后台可见）：%s" % detail
+                      detail = "、".join(names) if names else "奖励已发放"
+                      return True, "签到成功，%s。后台「任务中心」按钮会变成「已签到」" % detail
                   if str(d2.get("msg")) == "has sign":
-                      return True, "任务中心今日已签到（后台可见）"
+                      return True, "今天已经签过了，后台「任务中心」应是已签到状态"
                   ext = str(d2.get("ext_msg") or "")
                   if ext == "userNotLogin":
-                      return False, "任务中心：Cookie 登录态失效（userNotLogin），请重抓 WPS_TASK_COOKIE"
+                      return False, "登录态失效（userNotLogin）"
                   if "named cookie not present" in ext:
-                      return False, "任务中心：Cookie 缺 wps_sid，请重抓 WPS_TASK_COOKIE"
-                  return False, "任务中心：HTTP %s %s" % (st2, short(str(d2.get("msg") or ext or raw2), 120))
+                      return False, "Cookie 缺 wps_sid（named cookie not present）"
+                  return False, "HTTP %s %s" % (st2, short(str(d2.get("msg") or ext or raw2), 100))
               except Exception as e:
                   return False, "任务中心异常：%s: %s" % (type(e).__name__, e)
 
 
-          def wps_sign_final(task_cookie, wps_cookie, lingxi_cookie, uid):
-              """只有「任务中心签到」算 WPS 成功；灵犀智点/会员签到是附加动作，不再冒充签到成功。"""
-              ok, msg = task_center_sign(task_cookie, uid)
-              if ok:
-                  return True, msg
-              extra_ok, extra_msg = wps_sign(wps_cookie or task_cookie, lingxi_cookie)
-              tail = "；附加动作（非任务中心签到，不计入成功）：%s" % short(extra_msg, 150)
-              return False, "任务中心未签到 → " + msg + tail
+          def task_center_verify(cookie):
+              """签到后查一次任务中心后台（对齐 ZaiZaiCat 的 get_user_info），把真实积分带进卡片。"""
+              url = ("https://personal-act.wps.cn/activity-rubik/activity/page_info"
+                     "?activity_number=HD2025031821201822&page_number=YM2025041617143388")
+              hdr = {
+                  "User-Agent": UA_PC,
+                  "Accept": "application/json, text/plain, */*",
+                  "Cookie": cookie,
+                  "Referer": "https://personal-act.wps.cn/rubik2/portal/HD2025031821201822/YM2025041617143388?position=mac_grzx_sign",
+              }
+              try:
+                  st, raw = http(url, headers=hdr)
+                  d = as_json(raw)
+                  print("  [WPS·后台核对] HTTP %s" % st)
+                  if d.get("result") != "ok" or not isinstance(d.get("data"), list):
+                      return ""
+                  info = {}
+                  for item in d["data"]:
+                      if isinstance(item, dict) and item.get("type") == 36:
+                          tc = item.get("task_center_user_info") or {}
+                          if isinstance(tc, dict):
+                              info = tc
+                          break
+                  pts, days = info.get("integral"), info.get("total_effect_days")
+                  bits = []
+                  if isinstance(pts, (int, float)) and pts:
+                      bits.append("页面「我的积分」= %s" % pts)
+                  if isinstance(days, (int, float)) and days:
+                      bits.append("累计有效签到 %s 天" % days)
+                  return "；后台核对：" + "、".join(bits) if bits else ""
+              except Exception as e:
+                  print("  [WPS·后台核对] 查询失败（不影响签到结果）: %s" % type(e).__name__)
+                  return ""
 
 
-          def wps_sign(cookie, lingxi_cookie):
-              """WPS 附加动作：灵犀智点 / 会员签到 / 2018 打卡 / 稻壳，均不等于任务中心签到。"""
-              cookie = (cookie or "").strip()
-              m = re.search(r"(?:^|[;,\s])wps_sid=([^;,\s]+)", cookie)
-              sid = m.group(1) if m else (cookie if cookie.startswith("V02S") else "")
-              cookie_header = cookie if "wps_sid=" in cookie else ("wps_sid=" + sid if sid else cookie)
-              notes = []
-
-              # ---------- 路径 1：WPS 灵犀任务中心（无验证码，2026-11 官方论坛验证） ----------
-              lc = (lingxi_cookie or "").strip() or cookie
-              if lc:
-                  try:
-                      hdr = {"Cookie": lc, "User-Agent": UA_PC, "Accept": "application/json",
-                             "Referer": "https://lingxi.kdocs.cn/"}
-                      st, raw = http("https://lingxi.kdocs.cn/api/public/v1/tasks", headers=hdr)
-                      d = as_json(raw)
-                      print("  [WPS 灵犀·查询] HTTP %s %s" % (st, short(raw, 220)))
-                      tasks = ((d.get("data") or {}).get("tasks") or []) if isinstance(d.get("data"), dict) else []
-                      task = next((t for t in tasks if isinstance(t, dict) and t.get("task_key") == "daily_check_in"), None)
-                      if task and task.get("status") == "claimed":
-                          days = (task.get("extra") or {}).get("consecutive_days", "?")
-                          return True, "灵犀签到：今日已签到（连续 %s 天）" % days
-                      if task:
-                          hdr_claim = dict(hdr)
-                          hdr_claim["Content-Type"] = "application/json"
-                          st2, raw2 = http("https://lingxi.kdocs.cn/api/public/v1/tasks/daily_check_in/claim",
-                                           method="POST", headers=hdr_claim, body=b"")
-                          d2 = as_json(raw2)
-                          print("  [WPS 灵犀·领取] HTTP %s %s" % (st2, short(raw2, 220)))
-                          # 领取后复查状态，避免误报
-                          st3, raw3 = http("https://lingxi.kdocs.cn/api/public/v1/tasks", headers=hdr)
-                          d3 = as_json(raw3)
-                          tasks3 = ((d3.get("data") or {}).get("tasks") or []) if isinstance(d3.get("data"), dict) else []
-                          t3 = next((t for t in tasks3 if isinstance(t, dict) and t.get("task_key") == "daily_check_in"), None)
-                          if t3 and t3.get("status") == "claimed":
-                              reward = (t3.get("extra") or {}).get("today_reward", "")
-                              return True, "灵犀签到成功（+%s 智点）" % reward
-                          notes.append("灵犀领取: HTTP %s %s" % (st2, short(d2.get("msg") or d2.get("result") or raw2, 120)))
-                      else:
-                          notes.append("灵犀查询: HTTP %s %s" % (st, short(d.get("msg") or d.get("result") or raw, 120)))
-                  except Exception as e:
-                      notes.append("灵犀异常: %s: %s" % (type(e).__name__, e))
-              else:
-                  notes.append("灵犀: 未配置任何 Cookie")
-
-              # ---------- 路径 2：vip.wps.cn 会员每日签到 ----------
-              if sid:
-                  try:
-                      hdr = {"Cookie": "wps_sid=" + sid, "User-Agent": UA_PC, "Referer": "https://vip.wps.cn/"}
-                      st, raw = http("https://vip.wps.cn/sign/mobile/v3/get_data", headers=hdr)
-                      d = as_json(raw)
-                      print("  [WPS 会员·查询] HTTP %s %s" % (st, short(raw, 180)))
-                      if st == 200 and isinstance(d.get("data"), dict) and d["data"].get("is_sign"):
-                          return True, "会员签到：今日已签到"
-                      if st == 302:
-                          notes.append("会员查询: 该站点未登录（当前 Cookie 不被 vip.wps.cn 接受）")
-                      else:
-                          for attempt in range(3):
-                              data = {"platform": "8"}
-                              if attempt:
-                                  http("https://vip.wps.cn/checkcode/signin/captcha.png?platform=8&encode=0", headers=hdr)
-                                  data.update({"captcha_pos": "137.00431974731889, 36.00431593261568",
-                                               "img_witdh": "275.164", "img_height": "69.184"})
-                              body = "&".join("%s=%s" % (k, urllib.parse.quote(str(v))) for k, v in data.items()).encode()
-                              hdr_sign = dict(hdr)
-                              hdr_sign["Content-Type"] = "application/x-www-form-urlencoded"
-                              st2, raw2 = http("https://vip.wps.cn/sign/v2", method="POST",
-                                               headers=hdr_sign, body=body)
-                              d2 = as_json(raw2)
-                              print("  [WPS 会员·签到%d] HTTP %s %s" % (attempt + 1, st2, short(raw2, 180)))
-                              res = str(d2.get("result") or "")
-                              msg = str(d2.get("msg") or "")
-                              if res == "ok" or "已签" in msg or "已领取" in msg:
-                                  return True, "会员签到成功" + (" · " + msg if msg else "")
-                              if attempt == 2:
-                                  notes.append("会员签到: HTTP %s %s" % (st2, short(msg or res or raw2, 120)))
-                              time.sleep(0.4)
-                  except Exception as e:
-                      notes.append("会员签到异常: %s: %s" % (type(e).__name__, e))
-              else:
-                  notes.append("会员签到: 缺 wps_sid")
-
-              # ---------- 路径 3：2018 微信打卡（官方已加 captcha/client_code，保留兜底） ----------
-              if sid:
-                  try:
-                      st, raw = http("https://zt.wps.cn/2018/clock_in/api/clock_in?award=wps",
-                                     headers={"sid": sid, "User-Agent": UA_PC, "Referer": "https://zt.wps.cn/"})
-                      d = as_json(raw)
-                      msg = str(d.get("msg") or "")
-                      print("  [WPS 打卡] HTTP %s %s" % (st, short(raw, 180)))
-                      if str(d.get("result")) == "ok" or "已打卡" in msg or "已签到" in msg:
-                          return True, "打卡成功（微信打卡）" + (" · " + msg if msg else "")
-                      notes.append("打卡: " + short(msg or d.get("result") or raw, 120))
-                  except Exception as e:
-                      notes.append("打卡异常: %s: %s" % (type(e).__name__, e))
-
-              # ---------- 路径 4：稻壳 / App 签到 ----------
-              if cookie_header:
-                  try:
-                      st, raw = http("https://zt.wps.cn/2018/docer_check_in/api/checkin_today", method="POST",
-                                     headers={"Cookie": cookie_header, "User-Agent": UA_IPHONE,
-                                              "Origin": "https://zt.wps.cn",
-                                              "Referer": "https://zt.wps.cn/static/2019/docer_check_in_ios/dist/?position=member_ios",
-                                              "X-Requested-With": "XMLHttpRequest",
-                                              "Accept": "application/json, text/javascript, */*; q=0.01"})
-                      d = as_json(raw)
-                      msg = str(d.get("msg") or "")
-                      print("  [WPS 稻壳] HTTP %s %s" % (st, short(raw, 180)))
-                      if str(d.get("result")) == "ok" or "已签到" in msg or "已打卡" in msg or "recheckin" in msg:
-                          return True, "签到成功（稻壳/App）" + (" · " + msg if msg else "")
-                      notes.append("稻壳: " + short(msg or d.get("result") or raw, 120))
-                  except Exception as e:
-                      notes.append("稻壳异常: %s: %s" % (type(e).__name__, e))
-
-              joined = " ".join(notes)
-              if "no login" in joined.lower() or "无效" in joined or "未登录" in joined:
-                  notes.append("=> 登录态可能失效")
-              if "Captcha" in joined or "ClientCode" in joined:
-                  notes.append("=> 2018 打卡活动已加图形验证码，API 方式被官方限制；请改用 LINGXI_COOKIE 走灵犀签到")
-              return False, "；".join(notes[:5])
-
-
-          def netease_sign(cookie):
-              """网易云：dailyTask type=0(App) / type=1(Web)。"""
-              cookie = (cookie or "").strip()
-              if not cookie:
-                  return False, "未配置 NETEASE_COOKIE"
-              notes = []
-              for typ, ua, label in ((0, UA_IPHONE, "App"), (1, UA_MAC, "Web")):
-                  try:
-                      st, raw = http("https://music.163.com/api/point/dailyTask?type=%d" % typ,
-                                     headers={"Cookie": cookie, "User-Agent": ua,
-                                              "Referer": "https://music.163.com/"})
-                      d = as_json(raw)
-                      code = d.get("code")
-                      print("  [网易云 %s] HTTP %s %s" % (label, st, short(raw, 180)))
-                      if code in (200, -2) or "已签" in str(d.get("message") or ""):
-                          if code == -2:
-                              return True, "%s端今日已签到（重复签到 code=-2）" % label
-                          point = d.get("point")
-                          return True, "%s端签到成功：云贝/经验 +%s（code=200，可在云贝中心核对）" % (
-                              label, point if point is not None else "?")
-                      if code == 301:
-                          notes.append("%s: Cookie 失效或未登录（需含 MUSIC_U）" % label)
-                      else:
-                          notes.append("%s: code=%s %s" % (label, code, d.get("message") or ""))
-                  except Exception as e:
-                      notes.append("%s请求异常: %s: %s" % (label, type(e).__name__, e))
-              return False, "；".join(notes)
-
-
-          def push_feishu(webhook, secret, results, ok_count):
+          def push_feishu(webhook, secret, rows):
+              """rows: [(名称, 状态, 文案)]，状态 ok / fail / off。没启用的不算失败、不进分母。"""
               if not webhook:
-                  print("  [通知] 未配置 FEISHU_WEBHOOK，跳过推送")
+                  print("  [通知] 没填 FEISHU_WEBHOOK，跳过飞书推送")
                   return
-              lines = ["**%s** [%s] %s" % (name, "成功" if ok else "失败", short(msg, 260))
-                       for name, ok, msg in results]
-              template = "green" if ok_count == len(results) else ("red" if ok_count == 0 else "orange")
+              icon = {"ok": "✅", "fail": "❌", "off": "⬜"}
+              lines = ["**%s %s**：%s" % (icon[s], name, text) for name, s, text in rows]
+              ok_n = sum(1 for _, s, _ in rows if s == "ok")
+              fail_n = sum(1 for _, s, _ in rows if s == "fail")
+              if fail_n:
+                  title = "今日签到 · 有 %d 项没成功" % fail_n
+                  template = "orange"
+              elif ok_n:
+                  good = "、".join(name for name, s, _ in rows if s == "ok")
+                  title = "今日签到 · %s 已签到" % good
+                  template = "green"
+              else:
+                  title = "今日签到 · 还没有启用任何平台"
+                  template = "orange"
               card = {
                   "config": {"wide_screen_mode": True},
-                  "header": {"title": {"tag": "plain_text", "content": "每日签到报告 · %d/%d 成功" % (ok_count, len(results))},
-                             "template": template},
+                  "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
                   "elements": [
                       {"tag": "div", "text": {"tag": "lark_md", "content": chr(10).join(lines)}},
                       {"tag": "hr"},
-                      {"tag": "note", "elements": [{"tag": "plain_text", "content": "WPS 任务中心 + 网易云音乐 · 每天 14:00 自动运行"}]},
+                      {"tag": "note", "elements": [{"tag": "plain_text",
+                                                     "content": "每天下午 2 点自动运行 · 没启用的项目不会报错，也不影响网易云"}]},
                   ],
               }
               payload = {"msg_type": "interactive", "card": card}
@@ -329,63 +285,77 @@ jobs:
               try:
                   st, raw = http(webhook, method="POST", headers={"Content-Type": "application/json"},
                                  body=json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-                  print("  [通知] 飞书返回 HTTP %s: %s" % (st, short(raw, 160)))
+                  print("  [通知] 飞书返回 HTTP %s: %s" % (st, short(raw, 140)))
               except Exception as e:
                   print("  [通知] 推送失败: %s: %s" % (type(e).__name__, e))
 
 
           def main():
-              task_cookie = (os.environ.get("WPS_TASK_COOKIE") or "").strip()
+              task_cookie = norm_wps_cookie(os.environ.get("WPS_TASK_COOKIE"))
+              old_cookie = norm_wps_cookie(os.environ.get("WPS_COOKIE"))
               wps_uid = (os.environ.get("WPS_UID") or "").strip()
-              wps_cookie = (os.environ.get("WPS_COOKIE") or "").strip()
-              lingxi_cookie = (os.environ.get("LINGXI_COOKIE") or "").strip()
+              # 没填新 Secret 时，自动复用之前填过的 WPS_COOKIE，尽量让用户少操作一步
+              wps_cookie = task_cookie or old_cookie
+              wps_src = "WPS_TASK_COOKIE" if task_cookie else ("WPS_COOKIE（自动复用）" if old_cookie else "")
               netease_cookie = (os.environ.get("NETEASE_COOKIE") or "").strip()
               webhook = (os.environ.get("FEISHU_WEBHOOK") or "").strip()
               secret = (os.environ.get("FEISHU_SECRET") or "").strip()
 
-              if not task_cookie and not wps_cookie and not netease_cookie and not lingxi_cookie:
-                  print("::error::未配置任何 Cookie，请在仓库 Secrets 里添加")
-                  raise SystemExit(1)
+              print("=" * 46)
+              print("每日签到开始（下午 2 点）")
+              print("=" * 46)
+              rows = []
 
-              print("=" * 50)
-              print("每日签到开始（WPS 任务中心 + 网易云音乐）")
-              print("=" * 50)
-              results = []
-              print("[1/2] WPS 任务中心 ...")
-              ok, msg = wps_sign_final(task_cookie, wps_cookie, lingxi_cookie, wps_uid)
-              results.append(("WPS 任务中心", ok, msg))
-              print("  -> [%s] %s" % ("成功" if ok else "失败", msg))
-              print("[2/2] 网易云音乐 ...")
+              if wps_cookie:
+                  print("[WPS 任务中心] 已启用（Cookie 来源：%s），开始签到 ..." % wps_src)
+                  ok, msg = task_center_sign(wps_cookie, wps_uid)
+                  if ok:
+                      msg += task_center_verify(wps_cookie)
+                  print("  -> %s：%s" % ("成功" if ok else "没成功", msg))
+                  rows.append(("WPS 任务中心", "ok" if ok else "fail", msg if ok else humanize_wps(msg)))
+              else:
+                  print("[WPS 任务中心] 没启用（没有任何 WPS Cookie），跳过")
+                  rows.append(("WPS 任务中心", "off",
+                               "没启用。想签到就加一个 Secret `WPS_TASK_COOKIE`（教程第 3 步）；不加也完全不影响网易云"))
+
+              print("[网易云音乐] 开始签到 ...")
               ok, msg = netease_sign(netease_cookie)
-              results.append(("网易云音乐", ok, msg))
-              print("  -> [%s] %s" % ("成功" if ok else "失败", msg))
+              print("  -> %s：%s" % ("成功" if ok else "没成功", msg))
+              rows.append(("网易云音乐", "ok" if ok else "fail", msg))
 
-              ok_count = sum(1 for _, ok, _ in results if ok)
-              print("成功 %d/%d" % (ok_count, len(results)))
-              push_feishu(webhook, secret, results, ok_count)
-              # 只要有一项真签到成功，流程就算绿；卡片会如实显示每一项结果
-              print("流程结束：至少一项成功即标记成功，逐项结果见上方与飞书卡片")
-              raise SystemExit(0 if ok_count >= 1 else 1)
+              push_feishu(webhook, secret, rows)
+              ok_n = sum(1 for _, s, _ in rows if s == "ok")
+              print("流程结束：成功 %d 项" % ok_n)
+              # 网易云是唯一默认必跑项；它失败才标红，没启用的项目不算失败
+              raise SystemExit(0 if ok_n >= 1 else 1)
 
 
           main()
           PY
   anyrouter:
-    name: Any Router 账号签到
+    name: Any Router 账号签到（可选）
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    continue-on-error: true
     env:
       ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
+      ENABLE_ANYROUTER: ${{ secrets.ENABLE_ANYROUTER }}
     steps:
-      - name: 检查是否已配置账号
+      - name: 检查是否已启用
         id: check
         run: |
-          if [ -z "$ANYROUTER_ACCOUNTS" ]; then
-            echo "未配置 ANYROUTER_ACCOUNTS，跳过 Any Router 签到"
+          if [ "$ENABLE_ANYROUTER" = "no" ]; then
+            echo "已手动停用（ENABLE_ANYROUTER=no），跳过"
             echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "reason=manual_off" >> "$GITHUB_OUTPUT"
+          elif [ -z "$ANYROUTER_ACCOUNTS" ]; then
+            echo "没填 ANYROUTER_ACCOUNTS，跳过"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "reason=no_accounts" >> "$GITHUB_OUTPUT"
           else
-            echo "已配置 ANYROUTER_ACCOUNTS，开始签到"
+            echo "已配置账号，开始签到"
             echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "reason=running" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 拉取 Any Router 签到项目（固定版本）
@@ -419,14 +389,16 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         run: uv run python -m cloakbrowser install
 
-      - name: 执行签到
+      - name: 执行签到（日志留存，供飞书说明原因）
         id: checkin
         if: steps.check.outputs.enabled == 'true'
         env:
           CHECKIN_HEADLESS: "false"
           CHECKIN_HUMANIZE: "true"
           CHECKIN_WAIT_TIMEOUT_MS: "120000"
-        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run checkin.py
+        run: |
+          set -o pipefail
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run checkin.py 2>&1 | tee /tmp/anyrouter-checkin.log
 
       - name: 飞书通知（Any Router 结果）
         if: always()
@@ -434,6 +406,7 @@ jobs:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           ACCOUNTS_ENABLED: ${{ steps.check.outputs.enabled }}
+          AR_REASON: ${{ steps.check.outputs.reason }}
           CHECKIN_OUTCOME: ${{ steps.checkin.outcome }}
         run: |
           python3 - <<'PY'
@@ -442,40 +415,79 @@ jobs:
           import hmac
           import json
           import os
+          import re
           import time
           import urllib.request
 
           webhook = (os.environ.get("FEISHU_WEBHOOK") or "").strip()
           if not webhook:
-              print("未配置 FEISHU_WEBHOOK，无法推送 Any Router 通知")
+              print("没填 FEISHU_WEBHOOK，无法推送")
               raise SystemExit(0)
 
           enabled = (os.environ.get("ACCOUNTS_ENABLED") or "").strip() == "true"
+          reason = (os.environ.get("AR_REASON") or "").strip()
           outcome = (os.environ.get("CHECKIN_OUTCOME") or "").strip() or "skipped"
           ok = enabled and outcome == "success"
 
+          lines = []
           if not enabled:
-              status, template = "未签到", "orange"
-              detail = "未配置 ANYROUTER_ACCOUNTS，本次自动跳过，没有任何账号完成签到；如需签到请添加该 Secret"
+              status, template = "未启用", "orange"
+              if reason == "manual_off":
+                  detail = "你手动停用了（Secret ENABLE_ANYROUTER=no），今天没签到。想恢复就把这个 Secret 删掉"
+              elif reason == "no_accounts":
+                  detail = "没填账号密码，今天没签到。想用就加 Secret ANYROUTER_ACCOUNTS（教程第 4 步）"
+              else:
+                  detail = "本次没有运行，今天没签到"
           elif ok:
-              status, template = "成功", "green"
-              detail = "签到脚本执行完成，逐账号结果见 Actions 日志"
+              status, template = "签到成功", "green"
+              detail = "签到脚本跑完了，去 Any Router 网站看余额有没有变"
           else:
-              status, template = "失败", "red"
-              detail = "签到脚本执行结束（outcome=%s），逐账号结果见 Actions 日志" % outcome
+              status, template = "没签到成功", "orange"
+              detail = "签到脚本跑到一半失败了，下面是日志里最可能相关的几行："
 
-          lines = [
-              "**Any Router** [%s] %s" % (status, detail),
-              "**本次是否签到成功：%s**" % ("是" if ok else "否"),
-          ]
+          lines.append("**Any Router [%s]** %s" % (status, detail))
+
+          if not ok:
+              hints = []
+              try:
+                  with open("/tmp/anyrouter-checkin.log", encoding="utf-8", errors="replace") as f:
+                      log_lines = f.read().splitlines()
+                  keys = ("[FAILED]", "[WARN]", "登录失败", "密码", "账号", "错误", "失败",
+                          "Error", "error", "Exception", "timeout", "超时", "验证", "captcha")
+                  for ln in log_lines[-150:]:
+                      clean = re.sub(r"\x1b\[[0-9;]*m", "", ln).strip()
+                      if clean and any(k in clean for k in keys) and clean not in hints:
+                          hints.append(clean[:110])
+                  hints = hints[-3:]
+              except Exception:
+                  pass
+              if hints:
+                  lines.append("")
+                  lines.append("**日志关键行**")
+                  for h in hints:
+                      lines.append("· " + h)
+
+          if not ok:
+              lines.append("")
+              lines.append("**账号密码填在哪（照着核对一遍）**")
+              lines.append("1. 仓库 → Settings → Secrets and variables → Actions → New repository secret")
+              lines.append("2. Name 填 `ANYROUTER_ACCOUNTS`")
+              lines.append('3. Value 填 `[{"email":"你的登录邮箱","password":"你的登录密码"}]`')
+              lines.append("4. 用的是 anyrouter.top 网站自己的账号密码，不是 GitHub 密码；已填过就点 Update 重新确认一遍")
+
+          lines.append("")
+          lines.append("**本次是否签到成功：%s**" % ("是" if ok else "否"))
+          if not enabled:
+              lines.append("（这是「没启用」，不是出错；网易云和 WPS 完全不受影响）")
+
           card = {
               "config": {"wide_screen_mode": True},
-              "header": {"title": {"tag": "plain_text", "content": "Any Router 签到 · %s" % status},
+              "header": {"title": {"tag": "plain_text", "content": "Any Router · %s" % status},
                          "template": template},
               "elements": [
                   {"tag": "div", "text": {"tag": "lark_md", "content": chr(10).join(lines)}},
                   {"tag": "hr"},
-                  {"tag": "note", "elements": [{"tag": "plain_text", "content": "Any Router · 每天 14:00 自动运行"}]},
+                  {"tag": "note", "elements": [{"tag": "plain_text", "content": "Any Router · 每天下午 2 点"}]},
               ],
           }
           payload = {"msg_type": "interactive", "card": card}
