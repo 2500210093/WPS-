@@ -1,0 +1,14 @@
+{
+  "notify": {
+    "type": "feishu",
+    "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx-xxxx",
+    "secret": "",
+    "msg_type": "interactive"
+  },
+  "wps": {
+    "cookie": "你的WPS Cookie"
+  },
+  "netease": {
+    "cookie": "你的网易云音乐 Cookie（必须包含 __csrf 字段）"
+  }
+}

@@ -1,0 +1,64 @@
+name: 每日签到（WPS + 网易云音乐）
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions 的 cron 使用 UTC；12:00 UTC = 北京时间 20:00
+    - cron: '0 12 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify project files
+        run: |
+          for f in run.py notify.py sign/netease.py sign/wps.py; do
+            if [ ! -f "$f" ]; then
+              echo "::error::缺少文件 $f，请把交付包中的文件放到仓库根目录后重新运行"
+              exit 1
+            fi
+          done
+          if grep -q "bilibili" run.py; then
+            echo "::error::run.py 仍是旧版（含 B站等旧平台），请用交付包覆盖"
+            exit 1
+          fi
+          if ! grep -q "feishu" notify.py; then
+            echo "::error::notify.py 仍是旧版（无飞书通知），请用交付包覆盖"
+            exit 1
+          fi
+          if ! grep -q "encSecKey" sign/netease.py; then
+            echo "::error::sign/netease.py 仍是旧版（明文签到），请用交付包覆盖"
+            exit 1
+          fi
+          echo "项目文件齐全且为新版"
+
+      - name: Install dependencies
+        run: python -m pip install --quiet "requests>=2.28" "pycryptodome>=3.18"
+
+      - name: Run daily sign-in
+        env:
+          WPS_COOKIE: ${{ secrets.WPS_COOKIE }}
+          NETEASE_COOKIE: ${{ secrets.NETEASE_COOKIE }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+        run: python run.py
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sign-logs
+          path: sign.log
+          if-no-files-found: ignore
