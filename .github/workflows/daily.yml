@@ -16,12 +16,15 @@ jobs:
     steps:
       - name: Run daily sign-in
         env:
+          WPS_TASK_COOKIE: ${{ secrets.WPS_TASK_COOKIE }}
+          WPS_UID: ${{ secrets.WPS_UID }}
           WPS_COOKIE: ${{ secrets.WPS_COOKIE }}
           LINGXI_COOKIE: ${{ secrets.LINGXI_COOKIE }}
           NETEASE_COOKIE: ${{ secrets.NETEASE_COOKIE }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
         run: |
+          if [ -n "$WPS_TASK_COOKIE" ]; then python3 -m pip install --quiet pycryptodome; fi
           python3 - <<'PY'
           import base64
           import hashlib
@@ -74,8 +77,83 @@ jobs:
               return text if len(text) <= n else text[:n] + "..."
 
 
+          def task_center_sign(cookie, uid):
+              """WPS 任务中心「签到领奖励」——用户后台能看到的那一个（AES + RSA 加密接口）。"""
+              cookie = (cookie or "").strip()
+              if not cookie:
+                  return False, "未配置 WPS_TASK_COOKIE（需含 wps_sid 与 uid 的任务中心 Cookie）"
+              if "wps_sid=" not in cookie:
+                  return False, "WPS_TASK_COOKIE 里没有 wps_sid，接口会报 named cookie not present"
+              m_uid = re.search(r"(?:^|[;,\s])uid=(\d+)", cookie)
+              user_id = int(uid) if str(uid or "").strip().isdigit() else (int(m_uid.group(1)) if m_uid else 0)
+              if not user_id:
+                  return False, "缺少 uid：请在 Cookie 里保留 uid=数字，或单独配置 WPS_UID"
+              try:
+                  from Crypto.Cipher import AES, PKCS1_v1_5
+                  from Crypto.PublicKey import RSA
+                  from Crypto.Util.Padding import pad
+              except ImportError as e:
+                  return False, "缺少加密库 pycryptodome（workflow 应自动安装）：%s" % e
+              import random
+              import string
+              base = {
+                  "User-Agent": UA_PC,
+                  "Accept": "application/json, text/plain, */*",
+                  "Content-Type": "application/json",
+                  "Origin": "https://personal-act.wps.cn",
+                  "Referer": "https://personal-act.wps.cn/",
+                  "Cookie": cookie,
+              }
+              try:
+                  st, raw = http("https://personal-bus.wps.cn/sign_in/v1/encrypt/key", headers=base)
+                  d = as_json(raw)
+                  print("  [WPS 任务中心·公钥] HTTP %s %s" % (st, short(raw, 120)))
+                  if d.get("result") != "ok" or not d.get("data"):
+                      return False, "获取公钥失败：HTTP %s %s" % (st, short(str(d.get("msg") or raw), 100))
+                  pub_pem = base64.b64decode(d["data"]).decode("utf-8")
+                  aes_key = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(22)) + str(int(time.time()))
+                  kb = aes_key.encode("utf-8")
+                  key_padded = kb + b"\x00" * (32 - len(kb))
+                  iv = aes_key[:16].encode("utf-8")
+                  plain = json.dumps({"user_id": user_id, "platform": 64}, separators=(",", ":")).encode("utf-8")
+                  extra = base64.b64encode(AES.new(key_padded, AES.MODE_CBC, iv).encrypt(pad(plain, 16))).decode("utf-8")
+                  token = base64.b64encode(PKCS1_v1_5.new(RSA.import_key(pub_pem)).encrypt(aes_key.encode("utf-8"))).decode("utf-8")
+                  body = json.dumps({"encrypt": True, "extra": extra, "pay_origin": "pc_ucs_rwzx_sign"}).encode("utf-8")
+                  st2, raw2 = http("https://personal-bus.wps.cn/sign_in/v1/sign_in",
+                                   method="POST", headers=dict(base, token=token), body=body)
+                  d2 = as_json(raw2)
+                  print("  [WPS 任务中心·签到] HTTP %s %s" % (st2, short(raw2, 220)))
+                  if d2.get("result") == "ok":
+                      data = d2.get("data") or {}
+                      rewards = data.get("rewards") or []
+                      names = [str(r.get("reward_name", "")) for r in rewards
+                               if isinstance(r, dict) and r.get("reward_name")]
+                      detail = "、".join(names) if names else short(json.dumps(data, ensure_ascii=False), 100)
+                      return True, "任务中心签到成功（后台可见）：%s" % detail
+                  if str(d2.get("msg")) == "has sign":
+                      return True, "任务中心今日已签到（后台可见）"
+                  ext = str(d2.get("ext_msg") or "")
+                  if ext == "userNotLogin":
+                      return False, "任务中心：Cookie 登录态失效（userNotLogin），请重抓 WPS_TASK_COOKIE"
+                  if "named cookie not present" in ext:
+                      return False, "任务中心：Cookie 缺 wps_sid，请重抓 WPS_TASK_COOKIE"
+                  return False, "任务中心：HTTP %s %s" % (st2, short(str(d2.get("msg") or ext or raw2), 120))
+              except Exception as e:
+                  return False, "任务中心异常：%s: %s" % (type(e).__name__, e)
+
+
+          def wps_sign_final(task_cookie, wps_cookie, lingxi_cookie, uid):
+              """只有「任务中心签到」算 WPS 成功；灵犀智点/会员签到是附加动作，不再冒充签到成功。"""
+              ok, msg = task_center_sign(task_cookie, uid)
+              if ok:
+                  return True, msg
+              extra_ok, extra_msg = wps_sign(wps_cookie or task_cookie, lingxi_cookie)
+              tail = "；附加动作（非任务中心签到，不计入成功）：%s" % short(extra_msg, 150)
+              return False, "任务中心未签到 → " + msg + tail
+
+
           def wps_sign(cookie, lingxi_cookie):
-              """WPS：按可靠性依次尝试 4 条路径，任一确认成功即返回。"""
+              """WPS 附加动作：灵犀智点 / 会员签到 / 2018 打卡 / 稻壳，均不等于任务中心签到。"""
               cookie = (cookie or "").strip()
               m = re.search(r"(?:^|[;,\s])wps_sid=([^;,\s]+)", cookie)
               sid = m.group(1) if m else (cookie if cookie.startswith("V02S") else "")
@@ -211,7 +289,11 @@ jobs:
                       code = d.get("code")
                       print("  [网易云 %s] HTTP %s %s" % (label, st, short(raw, 180)))
                       if code in (200, -2) or "已签" in str(d.get("message") or ""):
-                          return True, "%s端签到成功（code=%s）" % (label, code)
+                          if code == -2:
+                              return True, "%s端今日已签到（重复签到 code=-2）" % label
+                          point = d.get("point")
+                          return True, "%s端签到成功：云贝/经验 +%s（code=200，可在云贝中心核对）" % (
+                              label, point if point is not None else "?")
                       if code == 301:
                           notes.append("%s: Cookie 失效或未登录（需含 MUSIC_U）" % label)
                       else:
@@ -235,7 +317,7 @@ jobs:
                   "elements": [
                       {"tag": "div", "text": {"tag": "lark_md", "content": chr(10).join(lines)}},
                       {"tag": "hr"},
-                      {"tag": "note", "elements": [{"tag": "plain_text", "content": "WPS + 网易云音乐 · 每天 14:00 自动运行"}]},
+                      {"tag": "note", "elements": [{"tag": "plain_text", "content": "WPS 任务中心 + 网易云音乐 · 每天 14:00 自动运行"}]},
                   ],
               }
               payload = {"msg_type": "interactive", "card": card}
@@ -253,23 +335,25 @@ jobs:
 
 
           def main():
+              task_cookie = (os.environ.get("WPS_TASK_COOKIE") or "").strip()
+              wps_uid = (os.environ.get("WPS_UID") or "").strip()
               wps_cookie = (os.environ.get("WPS_COOKIE") or "").strip()
               lingxi_cookie = (os.environ.get("LINGXI_COOKIE") or "").strip()
               netease_cookie = (os.environ.get("NETEASE_COOKIE") or "").strip()
               webhook = (os.environ.get("FEISHU_WEBHOOK") or "").strip()
               secret = (os.environ.get("FEISHU_SECRET") or "").strip()
 
-              if not wps_cookie and not netease_cookie and not lingxi_cookie:
+              if not task_cookie and not wps_cookie and not netease_cookie and not lingxi_cookie:
                   print("::error::未配置任何 Cookie，请在仓库 Secrets 里添加")
                   raise SystemExit(1)
 
               print("=" * 50)
-              print("每日签到开始（WPS 多路径 + 网易云音乐）")
+              print("每日签到开始（WPS 任务中心 + 网易云音乐）")
               print("=" * 50)
               results = []
-              print("[1/2] WPS ...")
-              ok, msg = wps_sign(wps_cookie, lingxi_cookie)
-              results.append(("WPS", ok, msg))
+              print("[1/2] WPS 任务中心 ...")
+              ok, msg = wps_sign_final(task_cookie, wps_cookie, lingxi_cookie, wps_uid)
+              results.append(("WPS 任务中心", ok, msg))
               print("  -> [%s] %s" % ("成功" if ok else "失败", msg))
               print("[2/2] 网易云音乐 ...")
               ok, msg = netease_sign(netease_cookie)
