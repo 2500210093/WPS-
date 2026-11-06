@@ -406,7 +406,7 @@ jobs:
                       {"tag": "div", "text": {"tag": "lark_md", "content": chr(10).join(lines)}},
                       {"tag": "hr"},
                       {"tag": "note", "elements": [{"tag": "plain_text",
-                                                     "content": "每天下午 2 点自动运行 · 版本 V6 · 没启用的项目不会报错，也不影响网易云"}]},
+                                                     "content": "每天下午 2 点自动运行 · 版本 V7 · 没启用的项目不会报错，也不影响网易云"}]},
                   ],
               }
               payload = {"msg_type": "interactive", "card": card}
@@ -474,22 +474,43 @@ jobs:
       ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
       ENABLE_ANYROUTER: ${{ secrets.ENABLE_ANYROUTER }}
     steps:
-      - name: 检查是否已启用
+      - name: 准备签到配置
         id: check
+        env:
+          ANYROUTER_RAW_COOKIE: ${{ secrets.ANYROUTER_RAW_COOKIE }}
         run: |
-          if [ "$ENABLE_ANYROUTER" = "no" ]; then
-            echo "已手动停用（ENABLE_ANYROUTER=no），跳过"
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "reason=manual_off" >> "$GITHUB_OUTPUT"
-          elif [ -z "$ANYROUTER_ACCOUNTS" ]; then
-            echo "没填 ANYROUTER_ACCOUNTS，跳过"
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "reason=no_accounts" >> "$GITHUB_OUTPUT"
-          else
-            echo "已配置账号，开始签到"
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "reason=running" >> "$GITHUB_OUTPUT"
-          fi
+          python3 - <<'PY'
+          import json, os, re
+          raw = (os.environ.get("ANYROUTER_RAW_COOKIE") or "").strip()
+          accounts = (os.environ.get("ANYROUTER_ACCOUNTS") or "").strip()
+          manual_off = (os.environ.get("ENABLE_ANYROUTER") or "").strip() == "no"
+          cfg, mode, reason = "", "", ""
+          if manual_off:
+              reason = "manual_off"
+              print("已手动停用（ENABLE_ANYROUTER=no），跳过")
+          elif raw:
+              m = re.search(r"(?:^|[;\s])session=([^;\s]+)", raw)
+              sid = m.group(1).strip().strip('"').strip("'") if m else ""
+              if not sid:
+                  reason = "raw_no_session"
+                  print("这串 Cookie 里没找到 session=...，请复制 Network 里完整的 cookie 那一行")
+              else:
+                  cfg = json.dumps([{"cookies": {"session": sid}}], ensure_ascii=False)
+                  mode, reason = "session", "running"
+                  print("已用浏览器 Cookie 生成 session 配置（不走账号密码登录）")
+          elif accounts:
+              cfg, mode, reason = accounts, "account", "running"
+              print("使用 ANYROUTER_ACCOUNTS 原样配置")
+          else:
+              reason = "no_accounts"
+              print("没填任何账号配置，跳过")
+          with open("/tmp/ar_accounts.json", "w", encoding="utf-8") as f:
+              f.write(cfg)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("enabled=%s\n" % ("true" if cfg else "false"))
+              f.write("reason=%s\n" % reason)
+              f.write("mode=%s\n" % mode)
+          PY
 
       - name: 拉取 Any Router 签到项目（固定版本）
         if: steps.check.outputs.enabled == 'true'
@@ -522,15 +543,17 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         run: uv run python -m cloakbrowser install
 
-      - name: 执行签到（日志留存，供飞书说明原因）
+      - name: 执行签到（日志留存）
         id: checkin
         if: steps.check.outputs.enabled == 'true'
         env:
           CHECKIN_HEADLESS: "false"
           CHECKIN_HUMANIZE: "true"
           CHECKIN_WAIT_TIMEOUT_MS: "120000"
+          DEBUG_MODE: "true"
         run: |
           set -o pipefail
+          export ANYROUTER_ACCOUNTS="$(cat /tmp/ar_accounts.json)"
           xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run checkin.py 2>&1 | tee /tmp/anyrouter-checkin.log
 
       - name: 飞书通知（Any Router 结果）
@@ -540,6 +563,7 @@ jobs:
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           ACCOUNTS_ENABLED: ${{ steps.check.outputs.enabled }}
           AR_REASON: ${{ steps.check.outputs.reason }}
+          AR_MODE: ${{ steps.check.outputs.mode }}
           CHECKIN_OUTCOME: ${{ steps.checkin.outcome }}
         run: |
           python3 - <<'PY'
@@ -559,6 +583,7 @@ jobs:
 
           enabled = (os.environ.get("ACCOUNTS_ENABLED") or "").strip() == "true"
           reason = (os.environ.get("AR_REASON") or "").strip()
+          mode = (os.environ.get("AR_MODE") or "").strip()
           outcome = (os.environ.get("CHECKIN_OUTCOME") or "").strip() or "skipped"
           log_path = (os.environ.get("AR_LOG_PATH") or "/tmp/anyrouter-checkin.log").strip()
 
@@ -574,11 +599,15 @@ jobs:
               if c:
                   clean_lines.append(c)
 
-          # 真签到：日志里必须有签到成功标记，不能只看脚本有没有跑完
           signed = any(k in log_text for k in (
               "Check-in successful", "Already checked in today", "All accounts check-in successful"))
           login_failed = any(k in log_text for k in (
               "not verified", "Email/password login failed", "Login verification failed"))
+          waf_hit = any(k in log_text for k in (
+              "Unable to get WAF cookies", "WAF", "acw_sc__v2", "captcha", "challenge"))
+          session_mode = (mode == "session"
+                          or "Using auth method -> session cookies" in log_text
+                          or "Bypass WAF not required, using user cookies directly" in log_text)
           ok = enabled and outcome == "success" and signed
 
           lines = []
@@ -586,8 +615,10 @@ jobs:
               status, template = "未启用", "orange"
               if reason == "manual_off":
                   detail = "你手动停用了（Secret ENABLE_ANYROUTER=no），今天没签到。想恢复就把这个 Secret 删掉"
+              elif reason == "raw_no_session":
+                  detail = "ANYROUTER_RAW_COOKIE 里没找到 session=...，复制时要连 session= 一起、复制完整那一整行"
               elif reason == "no_accounts":
-                  detail = "没填账号，今天没签到。想用就加 Secret ANYROUTER_ACCOUNTS（教程第 4 步）"
+                  detail = "没填账号，今天没签到。想用就照下面加一个 Secret ANYROUTER_RAW_COOKIE"
               else:
                   detail = "本次没有运行，今天没签到"
           elif ok:
@@ -601,12 +632,16 @@ jobs:
               detail = "签到脚本没跑完，下面是日志里最相关的几行："
 
           lines.append("**Any Router [%s]** %s" % (status, detail))
+          lines.append("")
+          lines.append("**本次登录方式**：%s" % (
+              "浏览器 Cookie（session，绕开账号密码）" if mode == "session" else "账号密码 / 原配置"))
 
           if not ok:
               hints = []
               keys = ("[FAILED]", "[WARN]", "[ERROR]", "登录失败", "密码", "账号", "错误", "失败",
-                      "Error", "Exception", "timeout", "超时", "验证", "captcha", "not verified")
-              for ln in clean_lines[-200:]:
+                      "Error", "Exception", "timeout", "超时", "验证", "captcha", "not verified",
+                      "Current URL", "Got cookies", "WAF", "session", "401")
+              for ln in clean_lines[-250:]:
                   if any(k in ln for k in keys) and ln[:110] not in hints:
                       hints.append(ln[:110])
               hints = hints[-4:]
@@ -616,34 +651,44 @@ jobs:
                   for h in hints:
                       lines.append("· " + h)
 
-              if login_failed:
+              if reason == "raw_no_session":
                   lines.append("")
-                  lines.append("**这次卡在哪：网站没认出账号登录**")
-                  lines.append("· 邮箱密码没通过 anyrouter.top 的登录校验。常见原因：密码写错、账号是 GitHub/Google 第三方登录（本来就没有密码）、或登录时弹了验证码")
+                  lines.append("**复制的时候少了东西**")
+                  lines.append("· 要复制 F12 → Network → 请求头里 `cookie:` 后面**完整一整串**，里面要有 `session=一串字符`")
+              elif login_failed and not session_mode:
                   lines.append("")
-                  lines.append("**办法 B（推荐）：改用 session，不用浏览器登录**")
-                  lines.append("1. 电脑 Chrome 打开 anyrouter.top 并登录，按 F12 → Application（应用）→ Cookies → 复制名为 session 的值")
-                  lines.append("2. 同一页面 F12 → Network → 随便点一下，找请求头 New-Api-User，记下那串数字")
-                  lines.append("3. 仓库 → Settings → Secrets and variables → Actions → `ANYROUTER_ACCOUNTS` → Update")
-                  lines.append('4. 把值整个换成：`[{"cookies":{"session":"刚才复制的值"},"api_user":"那串数字"}]`')
-                  lines.append("5. 两种写法只能选一种：用了 cookies 就不要再写 email 和 password；session 大约一个月过期，过期后重新复制一次")
+                  lines.append("**这次卡在哪：还在用账号密码登录，网站没认出来**")
+                  lines.append("· 日志里有 `Email/password login failed`，说明 Secret 还是账号密码那种，所以和上次一样")
                   lines.append("")
-                  lines.append("**办法 A：继续用账号密码**")
-                  lines.append('1. 先在浏览器手动登录一次 anyrouter.top，确认邮箱密码真的能登进去')
-                  lines.append("2. 仓库 → Settings → Secrets and variables → Actions → `ANYROUTER_ACCOUNTS` → Update")
-                  lines.append('3. 值填 `[{"email":"你的登录邮箱","password":"你的登录密码"}]`（网站自己的密码，不是 GitHub 密码）')
+                  lines.append("**只加 1 个 Secret 就能绕开登录（不用改 JSON、不用找 session）**")
+                  lines.append("1. 电脑 Chrome 打开 anyrouter.top 并登录，按 `F12` → Network（网络）→ 按 `F5` 刷新")
+                  lines.append("2. 点列表里第一个请求 → 右边 Headers → Request Headers → 找到 `cookie:` 那一行 → 复制**后面整串**")
+                  lines.append("3. 仓库 → Settings → Secrets and variables → Actions → New repository secret")
+                  lines.append("4. Name 填 `ANYROUTER_RAW_COOKIE`，Value 粘贴刚才那一整串 → Add secret")
+                  lines.append("5. 再 Run workflow 一次。原来的 `ANYROUTER_ACCOUNTS` 不用删，新的会自动优先")
+                  lines.append("· 卡片「本次登录方式」变成「浏览器 Cookie」就说明改生效了")
+              elif session_mode:
+                  lines.append("")
+                  lines.append("**session 方式也失败了**")
+                  lines.append("· 多半是这个 session 过期了，或网站把 GitHub 的服务器拦了")
+                  lines.append("· 重新登录 anyrouter.top → 重新复制 `cookie:` 那一整串 → 打开 Secret `ANYROUTER_RAW_COOKIE` 点 Update 覆盖 → 再跑一次")
+              elif waf_hit:
+                  lines.append("")
+                  lines.append("**网站的人机验证挡住了**")
+                  lines.append("· 日志里出现 WAF / 验证码，GitHub 的服务器 IP 被 anyrouter.top 拦了")
+                  lines.append("· 按上面 1~4 步加 `ANYROUTER_RAW_COOKIE` 再试一次；仍不行就是网站对云服务器限制，只能在你自己电脑上跑")
               else:
                   lines.append("")
-                  lines.append("**账号填在哪（照着核对一遍）**")
+                  lines.append("**账号填在哪**")
                   lines.append("1. 仓库 → Settings → Secrets and variables → Actions → New repository secret")
-                  lines.append("2. Name 填 `ANYROUTER_ACCOUNTS`")
-                  lines.append('3. Value 填 `[{"email":"你的登录邮箱","password":"你的登录密码"}]`')
-                  lines.append("4. 用的是 anyrouter.top 网站自己的账号密码，不是 GitHub 密码；已填过就点 Update 重新确认一遍")
+                  lines.append("2. Name 填 `ANYROUTER_RAW_COOKIE`")
+                  lines.append("3. Value 粘贴浏览器 F12 → Network → 请求头 `cookie:` 后面那一整串")
+                  lines.append("4. 想继续用账号密码也行，把 `ANYROUTER_ACCOUNTS` 点 Update 重新确认一遍")
 
           lines.append("")
           lines.append("**本次是否签到成功：%s**" % ("是" if ok else "否"))
           if not enabled:
-              lines.append("（这是「没启用」，不是出错；网易云和 WPS 完全不受影响）")
+              lines.append("（这是「没启用 / 没配好」，不是签到本身出错；网易云和 WPS 完全不受影响）")
 
           card = {
               "config": {"wide_screen_mode": True},
@@ -652,7 +697,7 @@ jobs:
               "elements": [
                   {"tag": "div", "text": {"tag": "lark_md", "content": chr(10).join(lines)}},
                   {"tag": "hr"},
-                  {"tag": "note", "elements": [{"tag": "plain_text", "content": "Any Router · 每天下午 2 点 · 版本 V6"}]},
+                  {"tag": "note", "elements": [{"tag": "plain_text", "content": "Any Router · 每天下午 2 点 · 版本 V7"}]},
               ],
           }
           payload = {"msg_type": "interactive", "card": card}
@@ -671,3 +716,4 @@ jobs:
           except Exception as e:
               print("飞书推送失败:", type(e).__name__, e)
           PY
+
