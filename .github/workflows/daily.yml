@@ -3,8 +3,8 @@ name: 每日签到（WPS + 网易云音乐 + Any Router）
 on:
   workflow_dispatch:
   schedule:
-    # GitHub Actions 的 cron 使用 UTC；12:00 UTC = 北京时间 20:00
-    - cron: '0 12 * * *'
+    # GitHub Actions 的 cron 使用 UTC；06:00 UTC = 北京时间 14:00（下午 2 点）
+    - cron: '0 6 * * *'
 
 permissions:
   contents: read
@@ -235,7 +235,7 @@ jobs:
                   "elements": [
                       {"tag": "div", "text": {"tag": "lark_md", "content": chr(10).join(lines)}},
                       {"tag": "hr"},
-                      {"tag": "note", "elements": [{"tag": "plain_text", "content": "WPS + 网易云音乐 · 每天 20:00 自动运行"}]},
+                      {"tag": "note", "elements": [{"tag": "plain_text", "content": "WPS + 网易云音乐 · 每天 14:00 自动运行"}]},
                   ],
               }
               payload = {"msg_type": "interactive", "card": card}
@@ -345,10 +345,11 @@ jobs:
         run: xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run checkin.py
 
       - name: 飞书通知（Any Router 结果）
-        if: always() && steps.check.outputs.enabled == 'true'
+        if: always()
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+          ACCOUNTS_ENABLED: ${{ steps.check.outputs.enabled }}
           CHECKIN_OUTCOME: ${{ steps.checkin.outcome }}
         run: |
           python3 - <<'PY'
@@ -362,17 +363,36 @@ jobs:
 
           webhook = (os.environ.get("FEISHU_WEBHOOK") or "").strip()
           if not webhook:
-              print("未配置 FEISHU_WEBHOOK，跳过 Any Router 通知")
+              print("未配置 FEISHU_WEBHOOK，无法推送 Any Router 通知")
               raise SystemExit(0)
-          outcome = (os.environ.get("CHECKIN_OUTCOME") or "unknown").strip()
-          ok = outcome == "success"
-          status = "成功" if ok else "失败"
-          text = "**Any Router** [%s] 签到脚本执行结束（outcome=%s），逐账号结果见 Actions 日志" % (status, outcome)
+
+          enabled = (os.environ.get("ACCOUNTS_ENABLED") or "").strip() == "true"
+          outcome = (os.environ.get("CHECKIN_OUTCOME") or "").strip() or "skipped"
+          ok = enabled and outcome == "success"
+
+          if not enabled:
+              status, template = "未签到", "orange"
+              detail = "未配置 ANYROUTER_ACCOUNTS，本次自动跳过，没有任何账号完成签到；如需签到请添加该 Secret"
+          elif ok:
+              status, template = "成功", "green"
+              detail = "签到脚本执行完成，逐账号结果见 Actions 日志"
+          else:
+              status, template = "失败", "red"
+              detail = "签到脚本执行结束（outcome=%s），逐账号结果见 Actions 日志" % outcome
+
+          lines = [
+              "**Any Router** [%s] %s" % (status, detail),
+              "**本次是否签到成功：%s**" % ("是" if ok else "否"),
+          ]
           card = {
               "config": {"wide_screen_mode": True},
               "header": {"title": {"tag": "plain_text", "content": "Any Router 签到 · %s" % status},
-                         "template": "green" if ok else "red"},
-              "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": text}}],
+                         "template": template},
+              "elements": [
+                  {"tag": "div", "text": {"tag": "lark_md", "content": chr(10).join(lines)}},
+                  {"tag": "hr"},
+                  {"tag": "note", "elements": [{"tag": "plain_text", "content": "Any Router · 每天 14:00 自动运行"}]},
+              ],
           }
           payload = {"msg_type": "interactive", "card": card}
           secret = (os.environ.get("FEISHU_SECRET") or "").strip()
