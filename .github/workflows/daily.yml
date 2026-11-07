@@ -3,11 +3,19 @@ name: 每日签到（网易云 + 可选 WPS / Any Router）
 on:
   workflow_dispatch:
   schedule:
-    # GitHub Actions 的 cron 使用 UTC；06:00 UTC = 北京时间 14:00（下午 2 点）
-    - cron: '0 6 * * *'
+    # GitHub 的 schedule 是「尽力而为」：整点高负载时可能延迟数小时，甚至整次丢弃。
+    # 因此避开整点，并设 3 个错峰时段互为备份；脚本已处理「今日已签」。
+    # cron 按 UTC 计时，括号内为北京时间（UTC+8）。
+    - cron: '13 3 * * *'    # 03:13 UTC = 11:13 北京（主时段）
+    - cron: '27 6 * * *'    # 06:27 UTC = 14:27 北京（备份，贴近原 14:00）
+    - cron: '41 10 * * *'   # 10:41 UTC = 18:41 北京（备份）
 
 permissions:
   contents: read
+
+concurrency:
+  group: wps-daily-checkin
+  cancel-in-progress: false
 
 jobs:
   sign:
